@@ -1,0 +1,60 @@
+{
+  "name": "Santosh Thakur",
+  "experienceYears": 7,
+  "targetRoles": [
+    "Full Stack AI Engineer",
+    "AI Engineer",
+    "Generative AI Engineer",
+    "Senior Full Stack Engineer",
+    "Senior Frontend Engineer",
+    "Senior React Developer",
+    "Senior Angular Developer"
+  ],
+  "primarySkills": [
+    "React",
+    "Next.js",
+    "TypeScript",
+    "JavaScript",
+    "Python",
+    "FastAPI",
+    "REST APIs",
+    "GraphQL",
+    "OpenAI",
+    "Azure OpenAI",
+    "LLM",
+    "Generative AI",
+    "RAG",
+    "Vector Search",
+    "AI Agents",
+    "Prompt Engineering",
+    "Function Calling",
+    "Streaming AI Responses"
+  ],
+  "secondarySkills": [
+    "Angular",
+    "Redux Toolkit",
+    "Apollo Client",
+    "Node.js",
+    "PostgreSQL",
+    "MongoDB",
+    "AWS",
+    "Azure",
+    "Docker",
+    "Kubernetes",
+    "CI/CD",
+    "WebSockets",
+    "SSE",
+    "Micro Frontends"
+  ],
+  "preferredLocations": [
+    "Remote",
+    "Bangalore",
+    "Hyderabad",
+    "Pune",
+    "Gurugram",
+    "Noida",
+    "Delhi NCR"
+  ],
+  "minimumExperience": 6,
+  "maximumExperience": 12
+}

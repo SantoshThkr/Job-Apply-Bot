@@ -1,0 +1,25 @@
+{
+  "name": "naukri-job-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Chrome automation that finds and pre-fills Naukri applications, stopping before submit.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "login": "node src/cli.ts login",
+    "session": "node src/cli.ts session",
+    "typecheck": "tsc",
+    "test": "LOG_LEVEL=silent vitest run --testTimeout=30000"
+  },
+  "dependencies": {
+    "playwright": "^1.63.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  }
+}
