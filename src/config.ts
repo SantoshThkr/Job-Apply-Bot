@@ -91,17 +91,46 @@ export const searchesSchema = z
     message: 'Search names must be unique',
   });
 
+export const answersSchema = z.array(
+  z.strictObject({
+    // Every phrase must appear in the question (case-insensitive) for the answer to be used.
+    match: textList.min(1),
+    answer: text,
+  }),
+);
+
 export type Profile = z.infer<typeof profileSchema>;
 export type Resume = z.infer<typeof resumeSchema>;
 export type Search = z.infer<typeof searchesSchema>[number];
+export type Answer = z.infer<typeof answersSchema>[number];
+
+// Paths of values still holding YOUR_* template text, so they never reach an application form.
+function findPlaceholders(value: unknown, path = ''): string[] {
+  if (typeof value === 'string') return /\bYOUR_[A-Z_]+/.test(value) ? [path] : [];
+  if (Array.isArray(value)) return value.flatMap((item, i) => findPlaceholders(item, `${path}[${i}]`));
+  if (value && typeof value === 'object') {
+    return Object.entries(value).flatMap(([key, item]) => findPlaceholders(item, path ? `${path}.${key}` : key));
+  }
+  return [];
+}
 
 function readConfig<T extends z.ZodType>(dir: string, file: string, schema: T): z.infer<T> {
+  const example = file.replace(/\.json$/, '.example.json');
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(join(dir, file), 'utf8'));
   } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new ConfigError(`config/${file} not found. Copy config/${example} to config/${file} and fill in your details.`);
+    }
     throw new ConfigError(`Cannot read config/${file}: ${(err as Error).message}`);
   }
+
+  const placeholders = findPlaceholders(raw);
+  if (placeholders.length) {
+    throw new ConfigError(`config/${file} still has template values at: ${placeholders.join(', ')}. Replace them with your own.`);
+  }
+
   const result = schema.safeParse(raw);
   if (!result.success) throw new ConfigError(`Invalid config/${file}:\n${z.prettifyError(result.error)}`);
   return result.data;
@@ -118,4 +147,8 @@ export function loadResume(dir = paths.config): Resume {
 
 export function loadSearches(dir = paths.config): Search[] {
   return readConfig(dir, 'searches.json', searchesSchema);
+}
+
+export function loadAnswers(dir = paths.config): Answer[] {
+  return readConfig(dir, 'answers.json', answersSchema);
 }

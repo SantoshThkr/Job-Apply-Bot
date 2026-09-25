@@ -2,9 +2,23 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ConfigError, ROOT, loadEnv, loadProfile, loadResume, loadSearches, paths } from '../src/config.ts';
+import {
+  ConfigError,
+  ROOT,
+  answersSchema,
+  loadEnv,
+  loadProfile,
+  loadResume,
+  loadSearches,
+  paths,
+  profileSchema,
+  resumeSchema,
+  searchesSchema,
+} from '../src/config.ts';
 
-const shippedProfile = JSON.parse(readFileSync(join(paths.config, 'profile.json'), 'utf8'));
+// Tests use only the public templates; config/*.json holds personal data and is not in the repo.
+const example = (file: string) => JSON.parse(readFileSync(join(paths.config, file), 'utf8'));
+const validProfile = { ...example('profile.example.json'), name: 'Test Candidate' };
 
 function configDir(files: Record<string, unknown>): string {
   const dir = mkdtempSync(join(tmpdir(), 'naukri-bot-config-'));
@@ -44,19 +58,38 @@ describe('loadEnv', () => {
 });
 
 describe('config files', () => {
-  it('loads the shipped profile, resume and searches', () => {
-    expect(loadProfile().name).toBe('Santosh Thakur');
-    expect(loadSearches().map((s) => s.name)).toEqual(['Full Stack AI', 'React AI', 'Senior Frontend']);
-    expect(loadResume().resumePath).toBe(join(ROOT, 'resume', 'Santosh-Thakur-Resume.pdf'));
+  it('ships example templates that match the schemas', () => {
+    expect(profileSchema.safeParse(example('profile.example.json')).success).toBe(true);
+    expect(resumeSchema.safeParse(example('resume.example.json')).success).toBe(true);
+    expect(searchesSchema.safeParse(example('searches.example.json')).success).toBe(true);
+    expect(answersSchema.safeParse(example('answers.example.json')).success).toBe(true);
+  });
+
+  it('loads a filled-in config and resolves the resume path', () => {
+    const dir = configDir({
+      'profile.json': validProfile,
+      'resume.json': { ...example('resume.example.json'), resumePath: './resume/cv.pdf', resumeName: 'cv.pdf', currentTitle: 'Engineer', currentLocation: 'Pune' },
+    });
+    expect(loadProfile(dir).name).toBe('Test Candidate');
+    expect(loadResume(dir).resumePath).toBe(join(ROOT, 'resume', 'cv.pdf'));
+  });
+
+  it('refuses a config that still has template values', () => {
+    const dir = configDir({ 'resume.json': example('resume.example.json') });
+    expect(() => loadResume(dir)).toThrow(/template values at: resumePath, resumeName, currentTitle, currentLocation/);
+  });
+
+  it('explains how to create a missing config', () => {
+    expect(() => loadProfile(configDir({}))).toThrow(/Copy config\/profile\.example\.json to config\/profile\.json/);
   });
 
   it('rejects an inverted experience range', () => {
-    const dir = configDir({ 'profile.json': { ...shippedProfile, minimumExperience: 12, maximumExperience: 6 } });
+    const dir = configDir({ 'profile.json': { ...validProfile, minimumExperience: 12, maximumExperience: 6 } });
     expect(() => loadProfile(dir)).toThrow(/minimumExperience must not exceed/);
   });
 
   it('rejects misspelled keys', () => {
-    const { minimumExperience, ...rest } = shippedProfile;
+    const { minimumExperience, ...rest } = validProfile;
     const dir = configDir({ 'profile.json': { ...rest, minimumExperiance: minimumExperience } });
     expect(() => loadProfile(dir)).toThrow(ConfigError);
   });

@@ -1,9 +1,31 @@
 node_modules/
+
+# Secrets
 .env
+.env.*
+!.env.example
+
+# Personal config: only the *.example.json templates are public
+config/*.json
+!config/*.example.json
+
+# Resume: only the placement instructions are public
+resume/*
+!resume/README.md
+
+# Browser profile (Naukri session), database, application history
 data/
+*.db
+*.sqlite
+*.sqlite3
+*storage-state*.json
+*storageState*.json
+*.har
+
+# Debug artifacts can show account details
 logs/
 debug/
-resume/
-*.db
-playwright-report/
+screenshots/
+traces/
 test-results/
+playwright-report/

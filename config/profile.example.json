@@ -1,0 +1,23 @@
+{
+  "name": "YOUR_NAME",
+  "experienceYears": 5,
+  "targetRoles": [
+    "Senior Frontend Engineer",
+    "Full Stack Engineer"
+  ],
+  "primarySkills": [
+    "React",
+    "TypeScript",
+    "Node.js"
+  ],
+  "secondarySkills": [
+    "PostgreSQL",
+    "Docker"
+  ],
+  "preferredLocations": [
+    "Remote",
+    "Bangalore"
+  ],
+  "minimumExperience": 4,
+  "maximumExperience": 10
+}

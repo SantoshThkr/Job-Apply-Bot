@@ -11,7 +11,9 @@
     "login": "node src/cli.ts login",
     "session": "node src/cli.ts session",
     "typecheck": "tsc",
-    "test": "LOG_LEVEL=silent vitest run --testTimeout=30000"
+    "test": "LOG_LEVEL=silent vitest run --testTimeout=30000",
+    "scan-secrets": "node scripts/scan-secrets.ts",
+    "prepare": "git config core.hooksPath .githooks 2>/dev/null || true"
   },
   "dependencies": {
     "playwright": "^1.63.0",

@@ -17,7 +17,19 @@ Everything runs on your machine. Your Naukri password is never stored or seen by
 ```bash
 npm install
 cp .env.example .env
+cp config/profile.example.json config/profile.json
+cp config/resume.example.json config/resume.json
+cp config/searches.example.json config/searches.json
+cp config/answers.example.json config/answers.json
 ```
+
+Then edit the copies:
+
+- Put your OpenAI key in `.env` (`OPENAI_API_KEY=YOUR_OPENAI_API_KEY`).
+- Replace every `YOUR_…` value in `config/*.json`. The bot won't load a file that still contains one, so a template value can never end up in an application.
+- Copy your resume PDF into `resume/` and set `resumePath` in `config/resume.json` (for example `./resume/YOUR_RESUME.pdf`).
+
+`.env`, `config/*.json` (except the `*.example.json` templates) and `resume/` are git-ignored, so your details stay on your machine.
 
 ## Log in to Naukri (once)
 
@@ -43,15 +55,19 @@ It exits with code 0 when the session is valid and 1 otherwise.
 | `config/profile.json` | Target roles, skills, preferred locations, experience range. |
 | `config/resume.json` | Resume file path and form answers such as notice period and expected salary. |
 | `config/searches.json` | Search groups: keywords, plus locations (these default to the profile's preferred locations). |
+| `config/answers.json` | Your answers to recurring application questions. An answer is used only when the question contains every phrase in its `match` list. |
 
-All config is validated on load. A misspelled key or an out-of-range value stops the run with a message that names the file and field.
+All config is validated on load. A misspelled key, an out-of-range value or a leftover `YOUR_…` placeholder stops the run with a message that names the file and field.
 
 ## Development
 
 ```bash
-npm test          # unit tests plus browser tests against mocked local pages (never the real site)
+npm test              # unit tests plus browser tests against mocked local pages (never the real site)
 npm run typecheck
+npm run scan-secrets  # checks every file git would commit for secrets and private files
 ```
+
+`npm install` also turns on a pre-commit hook (`.githooks/pre-commit`) that refuses commits containing private files (`.env`, `data/`, personal config, resumes, databases, logs, traces) or obvious credentials (OpenAI keys, bearer tokens, JWTs, Naukri cookies). It only warns about email addresses and phone numbers, because those are sometimes legitimate. Check every warning before you commit.
 
 Set `LOG_LEVEL=debug` for more detail. Logs are also written to `logs/`.
 
@@ -67,3 +83,4 @@ Set `LOG_LEVEL=debug` for more detail. Logs are also written to `logs/`.
 - The bot never solves or bypasses CAPTCHA, OTP, MFA or anti-bot checks. When it sees one, it pauses for you.
 - It does not hide that the browser is automated.
 - `data/browser-profile/` holds your Naukri session cookies. Treat it like a password: it's git-ignored, and you shouldn't share it. Deleting it logs the bot out.
+- If a real credential is ever committed, treat it as leaked even after deleting it. Revoke and rotate it, because it stays in git history.

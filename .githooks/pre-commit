@@ -1,0 +1,3 @@
+#!/bin/sh
+# Refuses commits containing secrets or private files; see scripts/scan-secrets.ts.
+exec node scripts/scan-secrets.ts --staged

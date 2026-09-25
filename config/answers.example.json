@@ -1,0 +1,14 @@
+[
+  {
+    "match": ["relocate"],
+    "answer": "YOUR_ANSWER"
+  },
+  {
+    "match": ["current ctc"],
+    "answer": "YOUR_CURRENT_CTC"
+  },
+  {
+    "match": ["work from office"],
+    "answer": "YOUR_ANSWER"
+  }
+]
