@@ -4,7 +4,7 @@ A local Chrome automation tool that finds Naukri jobs, scores them against your 
 
 Everything runs on your machine. Your Naukri password is never stored or seen by the bot: you log in by hand in a real Chrome window, and Chrome keeps the session in `data/browser-profile/`.
 
-> **Status:** Phase 1 is done: project setup, the Chrome session, and manual login. Job search, AI matching and the application flow are not built yet.
+> **Status:** Phases 1–2 are done: the Chrome session and manual login, then job search, extraction, de-duplication and local storage. AI matching and the application flow are not built yet.
 
 ## Requirements
 
@@ -47,6 +47,26 @@ npm run session
 
 It exits with code 0 when the session is valid and 1 otherwise.
 
+## Find jobs
+
+```bash
+npm run search                                       # every search in config/searches.json
+npm run search -- --keyword "YOUR_KEYWORD"           # one keyword, using your profile's locations
+npm run search -- --keyword "YOUR_KEYWORD" --location Remote
+npm run status                                       # what's stored so far
+```
+
+For each keyword the bot runs one Naukri search across your cities, plus a separate search with Naukri's Remote filter if `Remote` is in your locations. Results are filtered to your `experienceYears`.
+
+- **Paging:** it reads up to 3 pages per search. It stops a search early once a page has nothing new.
+- **Descriptions:** it opens each new job's page to read the full description.
+- **Limits:** a run stores at most `MAX_JOBS_PER_RUN` new jobs.
+- **Pacing:** it waits a random `DELAY_MIN_MS`–`DELAY_MAX_MS` between page loads.
+
+Jobs are stored in `data/jobs.db` (SQLite, git-ignored). The same job found by several searches is stored once. The bot matches on the Naukri job ID, then the job URL, then company, title and location together.
+
+If Naukri shows a CAPTCHA or OTP check mid-run, the bot pauses until you complete it in Chrome and press Enter. If Naukri blocks the browser or logs you out, the run stops. The bot doesn't retry against a block.
+
 ## Configuration
 
 | File | Purpose |
@@ -77,6 +97,8 @@ Set `LOG_LEVEL=debug` for more detail. Logs are also written to `logs/`.
 - **"Browser profile … is already in use".** Another bot run or its Chrome window is still open. Close it.
 - **Google sign-in fails in the bot's window.** Google often refuses sign-in from automated browsers. Use Naukri's email/password or OTP login instead.
 - **Using Playwright's Chromium instead of Chrome.** Set `BROWSER_CHANNEL=chromium` and run `npx playwright install chromium` once.
+- **A search or job page fails.** The bot logs a warning, saves a screenshot to `data/debug/` and moves on. Screenshots can show your account, so they stay local and git-ignored. Page structure lives in `src/browser/selectors.ts`, so that one file is where to fix a Naukri layout change.
+- **Starting over.** Delete `data/jobs.db*` to forget stored jobs. Your login in `data/browser-profile/` is unaffected.
 
 ## Security and limitations
 

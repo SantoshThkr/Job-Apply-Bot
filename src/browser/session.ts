@@ -8,6 +8,15 @@ export type LoginResult = 'LOGGED_IN' | 'CLOSED' | 'TIMED_OUT';
 
 const LOGIN_TIMEOUT_MS = 10 * 60_000;
 
+export const BLOCKED_MESSAGE =
+  'Naukri refused this browser (Access Denied). This happens with HEADLESS=true or after too many requests. ' +
+  'Wait a while and retry with a visible browser; the bot will not try to get around it.';
+
+// Ends a run on purpose (blocked, logged out, unsolved security check) rather than failing one step.
+export class RunStopped extends Error {
+  name = 'RunStopped';
+}
+
 function onNaukriPath(url: string | URL, prefix: string): boolean {
   const { hostname, pathname } = typeof url === 'string' ? new URL(url) : url;
   return hostname.endsWith('naukri.com') && pathname.startsWith(prefix);
@@ -49,6 +58,38 @@ export async function checkSession(page: Page, { settleMs = 10_000 } = {}): Prom
   const onLoggedInPage = onNaukriPath(page.url(), NAUKRI_PATHS.loggedInArea);
   const loginFormVisible = await page.locator(SESSION_SELECTORS.loginForm).isVisible();
   return onLoggedInPage && !loginFormVisible ? 'LOGGED_IN' : 'LOGGED_OUT';
+}
+
+// Resolves true when the user presses Enter, false on timeout or when nobody can answer.
+export async function pauseForUser(message: string, timeoutMs = LOGIN_TIMEOUT_MS): Promise<boolean> {
+  log.warn(message);
+  if (!process.stdin.isTTY) return false;
+  const input = createInterface({ input: process.stdin, terminal: false });
+  try {
+    return await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), timeoutMs);
+      input.once('line', () => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
+  } finally {
+    input.close();
+  }
+}
+
+// Run after every navigation during a run.
+export async function assertUsable(page: Page): Promise<void> {
+  let challenge = await detectChallenge(page);
+  if (challenge === 'CHALLENGE') {
+    await pauseForUser('PAUSED: manual action required. Complete the CAPTCHA/OTP check in Chrome, then press Enter.');
+    challenge = await detectChallenge(page);
+  }
+  if (challenge === 'BLOCKED') throw new RunStopped(BLOCKED_MESSAGE);
+  if (challenge === 'CHALLENGE') throw new RunStopped('The Naukri security check was not completed.');
+  if (onNaukriPath(page.url(), NAUKRI_PATHS.login)) {
+    throw new RunStopped('Naukri logged this browser out. Run `npm run login`, then retry.');
+  }
 }
 
 async function checkSessionInNewTab(context: BrowserContext): Promise<SessionState> {

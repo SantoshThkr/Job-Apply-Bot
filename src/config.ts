@@ -8,6 +8,7 @@ export const ROOT = fileURLToPath(new URL('..', import.meta.url));
 export const paths = {
   config: join(ROOT, 'config'),
   browserProfile: join(ROOT, 'data', 'browser-profile'),
+  database: join(ROOT, 'data', 'jobs.db'),
   debug: join(ROOT, 'data', 'debug'),
   logs: join(ROOT, 'logs'),
 };

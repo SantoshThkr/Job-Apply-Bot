@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import { chromium, type BrowserContext, type Page } from 'playwright';
-import { paths } from '../config.ts';
+import { ROOT, paths, type Env } from '../config.ts';
 import { log } from '../logger.ts';
 
 export async function launchBrowser({
@@ -37,4 +38,22 @@ export async function launchBrowser({
 
 export async function firstPage(context: BrowserContext): Promise<Page> {
   return context.pages()[0] ?? (await context.newPage());
+}
+
+// Spaces out page loads (DELAY_MIN_MS..DELAY_MAX_MS) so a run doesn't hammer Naukri.
+// This is rate limiting, not a readiness wait; readiness always uses locators and responses.
+export async function politePause(page: Page, env: Pick<Env, 'DELAY_MIN_MS' | 'DELAY_MAX_MS'>): Promise<void> {
+  await page.waitForTimeout(env.DELAY_MIN_MS + Math.random() * (env.DELAY_MAX_MS - env.DELAY_MIN_MS));
+}
+
+// Screenshots can show account details; they stay in data/debug (git-ignored) and are never uploaded.
+export async function saveDebugScreenshot(page: Page, label: string): Promise<void> {
+  try {
+    mkdirSync(paths.debug, { recursive: true });
+    const file = join(paths.debug, `${new Date().toISOString().replace(/[:.]/g, '-')}-${label}.png`);
+    await page.screenshot({ path: file });
+    log.info(`Screenshot saved: ${relative(ROOT, file)}`);
+  } catch (err) {
+    log.debug(`Could not save screenshot: ${(err as Error).message}`);
+  }
 }
