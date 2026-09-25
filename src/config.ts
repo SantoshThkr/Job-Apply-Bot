@@ -21,8 +21,16 @@ const int = (min: number, max: number) => z.coerce.number().int().min(min).max(m
 
 const envSchema = z
   .object({
+    // Local and free by default; OpenAI is opt-in.
+    AI_PROVIDER: z.enum(['ollama', 'openai']).default('ollama'),
+    OLLAMA_BASE_URL: z.url().default('http://localhost:11434'),
+    OLLAMA_MODEL: z.string().default('qwen3:8b'),
     OPENAI_API_KEY: z.string().optional(),
-    OPENAI_MODEL: z.string().optional(),
+    OPENAI_MODEL: z.string().default('gpt-5-mini'),
+    // One request at a time keeps a local model from saturating the machine.
+    AI_CONCURRENCY: int(1, 8).default(1),
+    // Attempts per job when the model returns output that fails validation.
+    AI_MAX_ATTEMPTS: int(1, 5).default(3),
     HEADLESS: z.stringbool().default(false),
     BROWSER_CHANNEL: z.enum(['chrome', 'chromium']).default('chrome'),
     MIN_MATCH_SCORE: int(0, 100).default(75),
@@ -35,6 +43,10 @@ const envSchema = z
   .refine((env) => env.DELAY_MIN_MS <= env.DELAY_MAX_MS, {
     message: 'DELAY_MIN_MS must not exceed DELAY_MAX_MS',
     path: ['DELAY_MAX_MS'],
+  })
+  .refine((env) => env.AI_PROVIDER !== 'openai' || env.OPENAI_API_KEY, {
+    message: 'OPENAI_API_KEY is required when AI_PROVIDER=openai (or set AI_PROVIDER=ollama for free local analysis)',
+    path: ['OPENAI_API_KEY'],
   });
 
 export type Env = z.infer<typeof envSchema>;
@@ -61,11 +73,21 @@ export const profileSchema = z
     preferredLocations: textList.min(1),
     minimumExperience: z.number().min(0),
     maximumExperience: z.number().min(0),
+    // Extra names that count as one of your skills, e.g. { "Node.js": ["Express"] }. Built-in aliases
+    // (LLM = Large Language Models, ...) live in src/jobs/skills.ts.
+    skillAliases: z.record(text, textList).default({}),
   })
   .refine((profile) => profile.minimumExperience <= profile.maximumExperience, {
     message: 'minimumExperience must not exceed maximumExperience',
     path: ['maximumExperience'],
-  });
+  })
+  .refine(
+    (profile) => {
+      const own = new Set([...profile.primarySkills, ...profile.secondarySkills].map((s) => s.toLowerCase()));
+      return Object.keys(profile.skillAliases).every((skill) => own.has(skill.toLowerCase()));
+    },
+    { message: 'Every skillAliases key must be one of your primarySkills or secondarySkills', path: ['skillAliases'] },
+  );
 
 export const resumeSchema = z.strictObject({
   resumePath: text,

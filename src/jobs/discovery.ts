@@ -103,7 +103,8 @@ export async function fetchMissingDetails(
   let failed = 0;
   if (!jobs.length) return { fetched, failed };
 
-  log.info(`Reading job descriptions: ${jobs.length}`);
+  const minutes = Math.ceil((jobs.length * ((env.DELAY_MIN_MS + env.DELAY_MAX_MS) / 2 + 1_500)) / 60_000);
+  log.info(`Reading ${jobs.length} job description(s), about ${minutes} min. Stopping early is safe; the rest wait for the next run.`);
   for (const [index, job] of jobs.entries()) {
     await politePause(page, env);
     try {

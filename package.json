@@ -11,6 +11,8 @@
     "login": "node --disable-warning=ExperimentalWarning src/cli.ts login",
     "session": "node --disable-warning=ExperimentalWarning src/cli.ts session",
     "search": "node --disable-warning=ExperimentalWarning src/cli.ts search",
+    "analyze": "node --disable-warning=ExperimentalWarning src/cli.ts analyze",
+    "dry-run": "node --disable-warning=ExperimentalWarning src/cli.ts dry-run",
     "status": "node --disable-warning=ExperimentalWarning src/cli.ts status",
     "typecheck": "tsc",
     "test": "LOG_LEVEL=silent NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest run --testTimeout=30000",

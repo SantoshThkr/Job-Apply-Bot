@@ -19,5 +19,10 @@
     "Bangalore"
   ],
   "minimumExperience": 4,
-  "maximumExperience": 10
+  "maximumExperience": 10,
+  "skillAliases": {
+    "Node.js": [
+      "Express"
+    ]
+  }
 }

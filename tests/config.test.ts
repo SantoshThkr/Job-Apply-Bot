@@ -38,6 +38,24 @@ describe('loadEnv', () => {
     expect(env.MIN_MATCH_SCORE).toBe(75);
   });
 
+  it('defaults to free local analysis with Ollama and needs no API key', () => {
+    expect(loadEnv({})).toMatchObject({
+      AI_PROVIDER: 'ollama',
+      OLLAMA_BASE_URL: 'http://localhost:11434',
+      OLLAMA_MODEL: 'qwen3:8b',
+      AI_CONCURRENCY: 1,
+      AI_MAX_ATTEMPTS: 3,
+    });
+    expect(loadEnv({}).OPENAI_API_KEY).toBeUndefined();
+  });
+
+  it('requires an OpenAI key only when OpenAI is chosen', () => {
+    expect(() => loadEnv({ AI_PROVIDER: 'openai' })).toThrow(/OPENAI_API_KEY is required when AI_PROVIDER=openai/);
+    expect(loadEnv({ AI_PROVIDER: 'openai', OPENAI_API_KEY: 'test-key' }).AI_PROVIDER).toBe('openai');
+    expect(() => loadEnv({ AI_PROVIDER: 'claude' })).toThrow(/AI_PROVIDER/);
+    expect(() => loadEnv({ OLLAMA_BASE_URL: 'localhost' })).toThrow(/OLLAMA_BASE_URL/);
+  });
+
   it('parses booleans and numbers from strings', () => {
     const env = loadEnv({ STOP_BEFORE_SUBMIT: 'false', HEADLESS: 'true', MAX_JOBS_PER_RUN: '20' });
     expect(env).toMatchObject({ STOP_BEFORE_SUBMIT: false, HEADLESS: true, MAX_JOBS_PER_RUN: 20 });
@@ -45,7 +63,7 @@ describe('loadEnv', () => {
 
   it('treats blank values as unset', () => {
     const env = loadEnv({ OPENAI_MODEL: '', MIN_MATCH_SCORE: ' ' });
-    expect(env.OPENAI_MODEL).toBeUndefined();
+    expect(env.OPENAI_MODEL).toBe('gpt-5-mini');
     expect(env.MIN_MATCH_SCORE).toBe(75);
   });
 
@@ -92,6 +110,13 @@ describe('config files', () => {
     const { minimumExperience, ...rest } = validProfile;
     const dir = configDir({ 'profile.json': { ...rest, minimumExperiance: minimumExperience } });
     expect(() => loadProfile(dir)).toThrow(ConfigError);
+  });
+
+  it('only accepts skill aliases for skills in the profile', () => {
+    const ok = configDir({ 'profile.json': { ...validProfile, skillAliases: { React: ['Preact'] } } });
+    expect(loadProfile(ok).skillAliases).toEqual({ React: ['Preact'] });
+    const bad = configDir({ 'profile.json': { ...validProfile, skillAliases: { Rust: ['Tokio'] } } });
+    expect(() => loadProfile(bad)).toThrow(/skillAliases key must be one of your/);
   });
 
   it('rejects duplicate search names', () => {

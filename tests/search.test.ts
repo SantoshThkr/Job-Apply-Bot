@@ -36,6 +36,7 @@ const profile: Profile = {
   preferredLocations: ['Remote', 'Bangalore'],
   minimumExperience: 6,
   maximumExperience: 12,
+  skillAliases: {},
 };
 
 describe('planQueries', () => {
