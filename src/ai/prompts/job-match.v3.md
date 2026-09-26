@@ -12,7 +12,7 @@ Skills — list each skill once, as a short name close to the posting's wording 
 - optionalSkills: skills mentioned in passing that are neither required nor preferred.
 - candidateSkill: copy one skill exactly as written in the candidate's primarySkills or secondarySkills, but only when it is the same skill or an obvious spelling variant ("React.js" and "React", "Large Language Models" and "LLM", "Postgres" and "PostgreSQL"). Otherwise use null. Never map a specific framework, product or cloud service to a broader skill: "LangGraph" is not "Python" or "AI Agents", "AWS Bedrock" is not "OpenAI", "Vue" is not "React". Never name a skill the candidate's profile does not list.
 
-roleRelevance — how well the actual role matches the candidate's targetRoles:
+roleRelevance — how well the actual role matches the candidate's targetRoles. Judge the kind of work only; seniority and years of experience do not matter here:
 - STRONG: the same kind of role as one of the target roles.
 - PARTIAL: overlapping but with a different emphasis (for example a backend-heavy full stack role for a frontend-leaning candidate).
 - WEAK: a different role that shares some skills.
@@ -26,7 +26,7 @@ aiFocus — how central AI, LLM or generative AI work is to the role:
 
 statedMinimumYears: the minimum total years of experience the description explicitly requires, as a number, or null if it does not say.
 
-otherRequirements: other stated hard requirements (degree, domain, certifications, notice period, work schedule, language, security clearance). Set met to YES only when the profile shows it, NO when the profile contradicts it, and UNKNOWN otherwise.
+otherRequirements: other stated hard requirements (degree, domain, certifications, notice period, work schedule, language, security clearance). Do not list years of experience here; statedMinimumYears records it. Set met to YES only when the profile shows it, NO when the profile contradicts it, and UNKNOWN otherwise.
 
 redFlags: concrete concerns a candidate should know before applying, stated or strongly implied by the posting. Examples: contract or freelance instead of full time, immediate joiners only, mandatory relocation, night shifts, service bond, unpaid trial work, a vague or copy-pasted description, or a title that does not match the actual work. Use an empty list if there are none.
 

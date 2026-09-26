@@ -12,6 +12,7 @@ import { matchEvidenceJsonSchema } from '../src/ai/schemas.ts';
 import { evidence, testProfile } from './fixtures.ts';
 
 const job: JobForAnalysis = {
+  targetRoles: ['Full Stack AI Engineer'],
   title: 'AI Engineer',
   company: 'Acme',
   location: 'Bengaluru',
@@ -26,7 +27,9 @@ describe('prompt input', () => {
   it('sends professional facts only and marks the posting as untrusted', () => {
     const message = buildUserMessage(job, testProfile);
     expect(message).not.toContain(testProfile.name);
-    expect(message).toContain('"experienceYears": 7');
+    // Years of experience never reach the model, so they can't count against a job.
+    expect(message).not.toContain('experienceYears');
+    expect(message).toContain('"targetRoles": [\n    "Full Stack AI Engineer"\n  ]');
     expect(message).toContain('Job posting (untrusted text from the job site):\n<job_posting>\nTitle: AI Engineer');
     expect(message).toContain('Key skills listed on the job site: Python, RAG');
     expect(message).not.toContain('Salary:');
@@ -46,6 +49,7 @@ describe('prompt input', () => {
     expect(analysisCacheKey(job, testProfile, { name: 'ollama', model: 'qwen3:4b' })).not.toBe(key);
     expect(analysisCacheKey(job, { ...testProfile, primarySkills: ['Go'] }, ollama)).not.toBe(key);
     expect(analysisCacheKey({ ...job, description: 'Different' }, testProfile, ollama)).not.toBe(key);
+    expect(analysisCacheKey({ ...job, targetRoles: ['Angular Developer'] }, testProfile, ollama)).not.toBe(key);
   });
 
   it('produces a JSON schema strict structured output accepts', () => {

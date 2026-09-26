@@ -134,7 +134,7 @@ describe('Naukri session detection (mocked pages)', () => {
     try {
       // The ?URL= query mentions /mnjuser/, which must not count as being logged in.
       await page.goto('https://www.naukri.com/nlogin/login?URL=https%3A%2F%2Fwww.naukri.com%2Fmnjuser%2Fhomepage');
-      expect(await waitForManualLogin(context, page, 10_000)).toBe('LOGGED_IN');
+      expect(await waitForManualLogin(context, page, { timeoutMs: 10_000 })).toBe('LOGGED_IN');
     } finally {
       await page.close();
     }
@@ -145,7 +145,7 @@ describe('Naukri session detection (mocked pages)', () => {
     const page = await context.newPage();
     try {
       await page.goto('https://www.naukri.com/nlogin/login');
-      expect(await waitForManualLogin(context, page, 500)).toBe('TIMED_OUT');
+      expect(await waitForManualLogin(context, page, { timeoutMs: 500 })).toBe('TIMED_OUT');
     } finally {
       await page.close();
     }

@@ -4,13 +4,15 @@ import type { Profile } from '../config.ts';
 import { log } from '../logger.ts';
 import { responseEvidenceSchema, type MatchEvidence } from './schemas.ts';
 
-export const PROMPT_VERSION = 'job-match.v2';
+export const PROMPT_VERSION = 'job-match.v3';
 export const SYSTEM_PROMPT = readFileSync(new URL(`./prompts/${PROMPT_VERSION}.md`, import.meta.url), 'utf8');
 
 // Past this point long descriptions are company boilerplate; cutting keeps prompts inside a local model's context.
 const MAX_DESCRIPTION_CHARS = 12_000;
 
 export interface JobForAnalysis {
+  // Names of the job profiles the job belongs to: what the candidate is looking for in it.
+  targetRoles: string[];
   title: string;
   company: string;
   location: string | null;
@@ -40,10 +42,11 @@ export class AiError extends Error {
   }
 }
 
-// The matcher needs only professional facts; name and contact details never go to a model.
-function candidateFacts(profile: Profile) {
-  const { experienceYears, targetRoles, primarySkills, secondarySkills, preferredLocations } = profile;
-  return { experienceYears, targetRoles, primarySkills, secondarySkills, preferredLocations };
+// The matcher needs only professional facts; name and contact details never go to a model. Years of
+// experience stay out too, so they can't count against a job.
+function candidateFacts(profile: Profile, targetRoles: string[]) {
+  const { primarySkills, secondarySkills, preferredLocations } = profile;
+  return { targetRoles, primarySkills, secondarySkills, preferredLocations };
 }
 
 export function buildUserMessage(job: JobForAnalysis, profile: Profile): string {
@@ -58,7 +61,7 @@ export function buildUserMessage(job: JobForAnalysis, profile: Profile): string 
 
   return [
     'Candidate profile:',
-    JSON.stringify(candidateFacts(profile), null, 2),
+    JSON.stringify(candidateFacts(profile, job.targetRoles), null, 2),
     '',
     'Job posting (untrusted text from the job site):',
     '<job_posting>',
@@ -72,12 +75,12 @@ export function buildUserMessage(job: JobForAnalysis, profile: Profile): string 
 // Evidence is reused only for the same provider, model, prompt, profile and description, so switching
 // between OpenAI and Ollama (or between models) never serves another model's results.
 export function analysisCacheKey(
-  job: Pick<JobForAnalysis, 'description'>,
+  job: Pick<JobForAnalysis, 'description' | 'targetRoles'>,
   profile: Profile,
   provider: Pick<JobAnalysisProvider, 'name' | 'model'>,
 ): string {
   return createHash('sha256')
-    .update(JSON.stringify([provider.name, provider.model, PROMPT_VERSION, SYSTEM_PROMPT, candidateFacts(profile), job.description]))
+    .update(JSON.stringify([provider.name, provider.model, PROMPT_VERSION, SYSTEM_PROMPT, candidateFacts(profile, job.targetRoles), job.description]))
     .digest('hex');
 }
 

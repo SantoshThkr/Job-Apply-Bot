@@ -1,16 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { hardFilterReason, locationMatches, type FilterableJob } from '../src/jobs/filtering.ts';
-import { testProfile } from './fixtures.ts';
+import { hardFilterReason, locationMatches, matchingProfiles, type FilterableJob } from '../src/jobs/filtering.ts';
+import { testJobProfiles, testProfile } from './fixtures.ts';
 
 const job = (overrides: Partial<FilterableJob>): FilterableJob => ({
   title: 'Full Stack AI Engineer',
   location: 'Bengaluru',
   workMode: 'Office',
-  experienceMin: 5,
-  experienceMax: 10,
   skills: [],
   ...overrides,
 });
+
+const reasonFor = (overrides: Partial<FilterableJob>) => {
+  const candidate = job(overrides);
+  return hardFilterReason(candidate, testProfile, matchingProfiles(candidate, testJobProfiles));
+};
+const profilesOf = (title: string, skills: string[] = []) => matchingProfiles({ title, skills }, testJobProfiles);
 
 describe('locationMatches', () => {
   const preferred = testProfile.preferredLocations;
@@ -49,30 +53,56 @@ describe('hardFilterReason', () => {
     'Sr Software Engineer - Web',
     'Freelance Agent Evaluation Engineer',
   ])('keeps "%s"', (title) => {
-    expect(hardFilterReason(job({ title }), testProfile)).toBeNull();
+    expect(reasonFor({ title })).toBeNull();
   });
 
   it.each(['Data Scientist', 'Data Engineer', 'Senior Moodle / Totara Developer', 'AEM Developer', '.NET Software Developer', 'Skywise Developer'])(
     'rejects "%s"',
     (title) => {
-      expect(hardFilterReason(job({ title }), testProfile)).toBe('Title does not match your target roles or skills');
+      expect(reasonFor({ title })).toBe('Title matches none of your job profiles');
     },
   );
 
   it('lets the listed skills decide for generic titles', () => {
-    expect(hardFilterReason(job({ title: 'Senior Software Engineer', skills: ['.NET', 'Node.js', 'React.js'] }), testProfile)).toBeNull();
-    expect(hardFilterReason(job({ title: 'Software Engineer', skills: ['Java', 'Spring Boot', 'Javascript'] }), testProfile)).not.toBeNull();
-    expect(hardFilterReason(job({ title: 'Sr. Developer', skills: ['Ai', 'Css', 'Finance'] }), testProfile)).not.toBeNull();
+    expect(reasonFor({ title: 'Senior Software Engineer', skills: ['.NET', 'Node.js', 'React.js'] })).toBeNull();
+    expect(reasonFor({ title: 'Software Engineer', skills: ['Java', 'Spring Boot', 'Javascript'] })).not.toBeNull();
+    expect(reasonFor({ title: 'Sr. Developer', skills: ['Ai', 'Css', 'Finance'] })).not.toBeNull();
   });
 
-  it('rejects experience ranges outside the profile limits', () => {
-    expect(hardFilterReason(job({ experienceMin: 13, experienceMax: 18 }), testProfile)).toBe('Needs 13+ years; your maximum is 12');
-    expect(hardFilterReason(job({ experienceMin: 2, experienceMax: 5 }), testProfile)).toBe('Aimed at up to 5 years; your minimum is 6');
-    expect(hardFilterReason(job({ experienceMin: null, experienceMax: null }), testProfile)).toBeNull();
+  it('never rejects a job for its experience range', () => {
+    // FilterableJob has no experience at all: the card's "0-2 Yrs" or "15+ Yrs" can't reach this check.
+    expect(reasonFor({ title: 'Junior React Developer' })).toBeNull();
+    expect(reasonFor({ title: 'Principal Frontend Architect (15+ years)' })).toBeNull();
   });
 
   it('rejects locations outside the preferred list, but never remote jobs', () => {
-    expect(hardFilterReason(job({ location: 'Chennai' }), testProfile)).toBe('Not in your preferred locations (Chennai)');
-    expect(hardFilterReason(job({ location: 'Remote', workMode: 'Remote' }), testProfile)).toBeNull();
+    expect(reasonFor({ location: 'Chennai' })).toBe('Not in your preferred locations (Chennai)');
+    expect(reasonFor({ location: 'Remote', workMode: 'Remote' })).toBeNull();
+  });
+});
+
+describe('matchingProfiles', () => {
+  it('puts a job in every profile its title names', () => {
+    expect(profilesOf('Senior React Developer')).toEqual(['frontend', 'react', 'broad']);
+    expect(profilesOf('Angular Developer')).toEqual(['frontend', 'angular', 'broad']);
+    expect(profilesOf('Full Stack AI Engineer')).toEqual(['fullstack', 'fullstack-ai', 'broad']);
+    expect(profilesOf('Frontend Engineer')).toEqual(['frontend', 'broad']);
+    expect(profilesOf('Web Developer')).toEqual(['web', 'broad']);
+    expect(profilesOf('Generative AI Engineer')).toEqual(['fullstack-ai']);
+  });
+
+  it('keeps plain React jobs out of the AI profile', () => {
+    expect(profilesOf('React.js Developer')).not.toContain('fullstack-ai');
+  });
+
+  it('keeps unrelated stacks out of the broad profile', () => {
+    expect(profilesOf('Java Full Stack Developer')).toEqual(['fullstack']);
+    expect(profilesOf('Senior DevOps Engineer')).toEqual([]);
+    expect(profilesOf('JavaScript Developer')).toEqual(['frontend', 'web', 'broad']);
+  });
+
+  it('reads profiles from configuration, so new ones need no code', () => {
+    const vue = { id: 'vue', name: 'Vue Developer', keywords: ['Vue Developer'], skills: ['Vue', 'Nuxt'], exclude: [], ai: false };
+    expect(matchingProfiles({ title: 'Nuxt Engineer', skills: [] }, [vue])).toEqual(['vue']);
   });
 });

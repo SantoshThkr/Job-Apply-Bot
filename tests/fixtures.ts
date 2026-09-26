@@ -1,26 +1,23 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { JobAnalysisProvider } from '../src/ai/analyzer.ts';
 import type { MatchEvidence } from '../src/ai/schemas.ts';
-import type { Profile } from '../src/config.ts';
+import { jobProfilesSchema, paths, type JobProfile, type Profile } from '../src/config.ts';
 
 // A generic full-stack/AI profile; not anyone's real data.
 export const testProfile: Profile = {
   name: 'Test Candidate',
   experienceYears: 7,
-  targetRoles: [
-    'Full Stack AI Engineer',
-    'AI Engineer',
-    'Generative AI Engineer',
-    'Senior Frontend Engineer',
-    'Senior React Developer',
-    'Senior Angular Developer',
-  ],
   primarySkills: ['React', 'Next.js', 'TypeScript', 'JavaScript', 'Python', 'FastAPI', 'OpenAI', 'LLM', 'Generative AI', 'RAG', 'AI Agents'],
   secondarySkills: ['Angular', 'Node.js', 'PostgreSQL', 'MongoDB', 'AWS', 'Azure', 'Docker'],
   preferredLocations: ['Remote', 'Bangalore', 'Hyderabad', 'Pune', 'Delhi NCR'],
-  minimumExperience: 6,
-  maximumExperience: 12,
   skillAliases: {},
 };
+
+// The job profiles that ship with the repository (never a personal config/job-profiles.json).
+export const testJobProfiles: JobProfile[] = jobProfilesSchema.parse(
+  JSON.parse(readFileSync(join(paths.config, 'job-profiles.example.json'), 'utf8')),
+);
 
 // skills(['React', 'React'], ['LangGraph', null]): job skill paired with the profile skill the model says covers it.
 export const skills = (...items: [string, string | null][]) =>

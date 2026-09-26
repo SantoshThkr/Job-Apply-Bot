@@ -1,9 +1,10 @@
-import { createInterface, type Interface } from 'node:readline';
+import type { EventEmitter } from 'node:events';
+import { createInterface } from 'node:readline';
 import type { BrowserContext, Frame, Page } from 'playwright';
+import type { SessionState, StopCode } from '../domain.ts';
 import { log } from '../logger.ts';
 import { CHALLENGE_SELECTORS, NAUKRI_PATHS, NAUKRI_URLS, SESSION_SELECTORS } from './selectors.ts';
 
-export type SessionState = 'LOGGED_IN' | 'LOGGED_OUT' | 'CHALLENGE' | 'BLOCKED';
 export type LoginResult = 'LOGGED_IN' | 'CLOSED' | 'TIMED_OUT';
 
 const LOGIN_TIMEOUT_MS = 10 * 60_000;
@@ -15,6 +16,18 @@ export const BLOCKED_MESSAGE =
 // Ends a run on purpose (blocked, logged out, unsolved security check) rather than failing one step.
 export class RunStopped extends Error {
   name = 'RunStopped';
+  code: StopCode;
+  constructor(message: string, code: StopCode) {
+    super(message);
+    this.code = code;
+  }
+}
+
+// The dashboard server has nobody watching its terminal, so a security check stops the run instead of
+// waiting for Enter.
+let canPause = true;
+export function disableManualPauses(): void {
+  canPause = false;
 }
 
 function onNaukriPath(url: string | URL, prefix: string): boolean {
@@ -32,6 +45,13 @@ export async function detectChallenge(page: Page): Promise<'BLOCKED' | 'CHALLENG
   const text = await page.locator('body').innerText({ timeout: 2_000 }).catch(() => '');
   return CHALLENGE_SELECTORS.text.test(text) ? 'CHALLENGE' : undefined;
 }
+
+export const SESSION_MESSAGES: Record<SessionState, string> = {
+  LOGGED_IN: 'Naukri session detected',
+  LOGGED_OUT: 'Not logged in to Naukri. Log in first (`npm run login`, or Start Login on the dashboard).',
+  CHALLENGE: 'PAUSED: Naukri is showing a CAPTCHA/OTP check. Complete it yourself in Chrome, then retry.',
+  BLOCKED: BLOCKED_MESSAGE,
+};
 
 export async function checkSession(page: Page, { settleMs = 10_000 } = {}): Promise<SessionState> {
   await page.goto(NAUKRI_URLS.loggedInHome, { waitUntil: 'domcontentloaded' });
@@ -60,10 +80,21 @@ export async function checkSession(page: Page, { settleMs = 10_000 } = {}): Prom
   return onLoggedInPage && !loginFormVisible ? 'LOGGED_IN' : 'LOGGED_OUT';
 }
 
+// Ends a run before it starts when the saved session can't be used.
+export async function requireSession(page: Page): Promise<void> {
+  const state = await checkSession(page);
+  if (state === 'LOGGED_IN') {
+    log.info(SESSION_MESSAGES.LOGGED_IN);
+    return;
+  }
+  const codes = { LOGGED_OUT: 'SESSION_EXPIRED', CHALLENGE: 'SECURITY_CHALLENGE', BLOCKED: 'ACCESS_DENIED' } as const;
+  throw new RunStopped(SESSION_MESSAGES[state], codes[state]);
+}
+
 // Resolves true when the user presses Enter, false on timeout or when nobody can answer.
 export async function pauseForUser(message: string, timeoutMs = LOGIN_TIMEOUT_MS): Promise<boolean> {
   log.warn(message);
-  if (!process.stdin.isTTY) return false;
+  if (!canPause || !process.stdin.isTTY) return false;
   const input = createInterface({ input: process.stdin, terminal: false });
   try {
     return await new Promise<boolean>((resolve) => {
@@ -85,10 +116,12 @@ export async function assertUsable(page: Page): Promise<void> {
     await pauseForUser('PAUSED: manual action required. Complete the CAPTCHA/OTP check in Chrome, then press Enter.');
     challenge = await detectChallenge(page);
   }
-  if (challenge === 'BLOCKED') throw new RunStopped(BLOCKED_MESSAGE);
-  if (challenge === 'CHALLENGE') throw new RunStopped('The Naukri security check was not completed.');
+  if (challenge === 'BLOCKED') throw new RunStopped(BLOCKED_MESSAGE, 'ACCESS_DENIED');
+  if (challenge === 'CHALLENGE') {
+    throw new RunStopped('Naukri is showing a security check (CAPTCHA/OTP). Complete it in Chrome yourself, then start again.', 'SECURITY_CHALLENGE');
+  }
   if (onNaukriPath(page.url(), NAUKRI_PATHS.login)) {
-    throw new RunStopped('Naukri logged this browser out. Run `npm run login`, then retry.');
+    throw new RunStopped('Naukri logged this browser out. Log in again, then retry.', 'SESSION_EXPIRED');
   }
 }
 
@@ -104,7 +137,10 @@ async function checkSessionInNewTab(context: BrowserContext): Promise<SessionSta
 
 type LoginSignal = 'navigated' | 'enter' | 'closed' | 'timeout';
 
-function nextLoginSignal(context: BrowserContext, page: Page, input: Interface, timeoutMs: number): Promise<LoginSignal> {
+// Emits 'line' when the user asks for a re-check; a readline interface on stdin does this on Enter.
+type Rechecks = Pick<EventEmitter, 'on' | 'off'>;
+
+function nextLoginSignal(context: BrowserContext, page: Page, input: Rechecks, timeoutMs: number): Promise<LoginSignal> {
   return new Promise((resolve) => {
     const onNavigated = (frame: Frame) => {
       if (frame === page.mainFrame() && onNaukriPath(frame.url(), NAUKRI_PATHS.loggedInArea)) finish('navigated');
@@ -133,10 +169,11 @@ function nextLoginSignal(context: BrowserContext, page: Page, input: Interface, 
 export async function waitForManualLogin(
   context: BrowserContext,
   page: Page,
-  timeoutMs = LOGIN_TIMEOUT_MS,
+  { timeoutMs = LOGIN_TIMEOUT_MS, rechecks }: { timeoutMs?: number; rechecks?: Rechecks } = {},
 ): Promise<LoginResult> {
   // terminal:false keeps Ctrl+C a real SIGINT, which Playwright uses to close Chrome cleanly.
-  const input = createInterface({ input: process.stdin, terminal: false });
+  const stdin = rechecks ? undefined : createInterface({ input: process.stdin, terminal: false });
+  const input = rechecks ?? stdin!;
   const deadline = Date.now() + timeoutMs;
   try {
     for (;;) {
@@ -146,10 +183,11 @@ export async function waitForManualLogin(
 
       const state = await checkSessionInNewTab(context);
       if (state === 'LOGGED_IN') return 'LOGGED_IN';
-      if (state === 'LOGGED_OUT') log.info('Not logged in yet. Finish logging in, then press Enter.');
-      else log.warn(`PAUSED: Naukri is showing a security check (${state}). Complete it in Chrome, then press Enter.`);
+      const retry = rechecks ? 'check the session again' : 'press Enter';
+      if (state === 'LOGGED_OUT') log.info(`Not logged in yet. Finish logging in, then ${retry}.`);
+      else log.warn(`PAUSED: Naukri is showing a security check (${state}). Complete it in Chrome, then ${retry}.`);
     }
   } finally {
-    input.close();
+    stdin?.close();
   }
 }

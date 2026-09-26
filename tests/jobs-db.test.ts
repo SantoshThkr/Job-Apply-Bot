@@ -5,7 +5,6 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MIGRATIONS, openDatabase } from '../src/db/database.ts';
 import {
-  JOB_STATUSES,
   canTransition,
   insertJob,
   jobCounts,
@@ -14,6 +13,7 @@ import {
   saveJobDetails,
   updateJobStatus,
 } from '../src/db/jobs.ts';
+import { JOB_STATUSES } from '../src/domain.ts';
 import { normalizeCard, type RawCard } from '../src/jobs/normalization.ts';
 
 function card(overrides: RawCard = {}) {
@@ -77,7 +77,7 @@ describe('jobs table', () => {
     insertJob(db, card(), 'AI');
     const second = card({ externalId: '444455556666', url: 'https://www.naukri.com/job-listings-x-444455556666', title: 'ML Engineer' });
     insertJob(db, second, 'AI');
-    const [first, other] = jobsNeedingDetails(db, 10);
+    const [first, other] = jobsNeedingDetails(db, { limit: 10 });
 
     saveJobDetails(db, first!.id, {
       description: 'Build RAG pipelines',
@@ -88,7 +88,7 @@ describe('jobs table', () => {
     });
     for (let i = 0; i < 3; i++) recordDetailFailure(db, other!.id);
 
-    expect(jobsNeedingDetails(db, 10)).toEqual([]);
+    expect(jobsNeedingDetails(db, { limit: 10 })).toEqual([]);
     const stored = db.prepare('SELECT description, skills, posted_at, work_mode FROM jobs WHERE id = ?').get(first!.id);
     expect(stored).toMatchObject({
       description: 'Build RAG pipelines',
@@ -118,7 +118,7 @@ describe('status transitions', () => {
   it('refuses an invalid move and records score and filter reason on a valid one', () => {
     const db = openDatabase(':memory:');
     insertJob(db, card(), 'AI');
-    const id = jobsNeedingDetails(db, 1)[0]!.id;
+    const id = jobsNeedingDetails(db, { limit: 1 })[0]!.id;
     expect(() => updateJobStatus(db, id, 'APPLIED', { matchScore: null, filterReason: null })).toThrow(/cannot move from DISCOVERED to APPLIED/);
     updateJobStatus(db, id, 'SKIPPED', { matchScore: null, filterReason: 'Needs 15+ years' });
     expect(db.prepare('SELECT status, filter_reason FROM jobs WHERE id = ?').get(id)).toEqual({
@@ -144,7 +144,7 @@ describe('migration to ANALYSIS_FAILED', () => {
       old.close();
 
       const db = openDatabase(file);
-      expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 3 });
+      expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: MIGRATIONS.length });
       expect(db.prepare('SELECT count(*) AS n FROM job_analysis').get()).toEqual({ n: 1 });
       expect(db.prepare('SELECT title, analysis_error FROM jobs').get()).toEqual({ title: 'AI Engineer', analysis_error: null });
       updateJobStatus(db, 1, 'ANALYSIS_FAILED', { matchScore: null, filterReason: null, analysisError: 'timed out' });
@@ -167,7 +167,7 @@ describe('database file', () => {
       first.close();
 
       const second = openDatabase(file);
-      expect(second.prepare('PRAGMA user_version').get()).toEqual({ user_version: 3 });
+      expect(second.prepare('PRAGMA user_version').get()).toEqual({ user_version: MIGRATIONS.length });
       expect(jobCounts(second, new Date(0)).total).toBe(1);
       second.close();
     } finally {

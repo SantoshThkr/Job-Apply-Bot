@@ -4,29 +4,36 @@ import { politePause, saveDebugScreenshot } from '../browser/browser.ts';
 import { readJobDetails } from '../browser/job-details.ts';
 import { buildSearchUrl, searchResultPages, type SearchQuery } from '../browser/search.ts';
 import { RunStopped } from '../browser/session.ts';
-import type { Env, Profile, Search } from '../config.ts';
+import type { Env, JobProfile, Profile } from '../config.ts';
 import { insertJob, jobsNeedingDetails, recordDetailFailure, saveJobDetails } from '../db/jobs.ts';
+import type { Freshness, JobScope } from '../domain.ts';
 import { log } from '../logger.ts';
+import { applyHardFilters } from './matching.ts';
 import { normalizeCard } from './normalization.ts';
-
-// Later pages are mostly weaker matches, and every page is another request.
-const MAX_PAGES_PER_SEARCH = 3;
 
 const isRemote = (location: string) => /^(remote|work from home|wfh)$/i.test(location.trim());
 
-// One query per keyword for the listed cities, plus one with Naukri's Remote filter when "Remote" is listed.
+// Naukri's freshness filter works in whole days; the exact window is applied locally afterwards.
+const JOB_AGE: Record<Freshness, number | null> = { today: 1, '24h': 1, '3d': 3, '7d': 7, all: null };
+
+// One query per profile keyword for your cities, plus one with Naukri's Remote filter when "Remote"
+// is one of your locations. --keyword searches just that keyword instead.
 export function planQueries(
-  searches: Search[],
-  profile: Profile,
-  override: { keyword?: string; location?: string } = {},
+  jobProfiles: JobProfile[],
+  profile: Pick<Profile, 'preferredLocations'>,
+  {
+    keywords = [],
+    locations = [],
+    freshness = 'all',
+  }: { keywords?: string[]; locations?: string[]; freshness?: Freshness } = {},
 ): SearchQuery[] {
-  const groups: Search[] = override.keyword ? [{ name: 'command line', keywords: [override.keyword] }] : searches;
+  const groups = keywords.length ? [{ id: 'command line', keywords }] : jobProfiles;
+  const wanted = locations.length ? locations : profile.preferredLocations;
+  const cities = wanted.filter((l) => !isRemote(l));
   const seen = new Set<string>();
   return groups
     .flatMap((group) => {
-      const wanted = override.location ? [override.location] : (group.locations ?? profile.preferredLocations);
-      const cities = wanted.filter((l) => !isRemote(l));
-      const base = { searchName: group.name, experience: profile.experienceYears };
+      const base = { searchName: group.id, jobAge: JOB_AGE[freshness] };
       return group.keywords.flatMap((keyword) => [
         ...(cities.length ? [{ ...base, keyword, locations: cities, remote: false }] : []),
         ...(wanted.some(isRemote) ? [{ ...base, keyword, locations: [], remote: true }] : []),
@@ -44,18 +51,27 @@ export function describeQuery(query: SearchQuery): string {
   return `${query.keyword} (${query.remote ? 'Remote' : query.locations.join(', ')})`;
 }
 
+// A closed window fails every later step the same way, so it ends the run like a block does.
+function stopIfClosed(page: Page, err: unknown): void {
+  if (err instanceof RunStopped) throw err;
+  if (page.isClosed()) throw new RunStopped('The browser window was closed during the run.', 'BROWSER_CLOSED');
+}
+
 export async function discoverJobs(
   page: Page,
   db: DatabaseSync,
   queries: SearchQuery[],
   env: Env,
+  signal?: AbortSignal,
 ): Promise<{ seen: number; added: number }> {
   let seen = 0;
   let added = 0;
 
+  const cap = env.MAX_JOBS_PER_RUN ?? Infinity;
   for (const [index, query] of queries.entries()) {
-    if (added >= env.MAX_JOBS_PER_RUN) {
-      log.info(`Reached MAX_JOBS_PER_RUN (${env.MAX_JOBS_PER_RUN}); skipping ${queries.length - index} remaining search(es)`);
+    if (signal?.aborted) break;
+    if (added >= cap) {
+      log.info(`Reached MAX_JOBS_PER_RUN (${cap}); skipping ${queries.length - index} remaining search(es)`);
       break;
     }
     if (index > 0) await politePause(page, env);
@@ -63,13 +79,13 @@ export async function discoverJobs(
 
     try {
       let pageNo = 0;
-      for await (const cards of searchResultPages(page, buildSearchUrl(query), MAX_PAGES_PER_SEARCH)) {
+      for await (const cards of searchResultPages(page, buildSearchUrl(query), env.SEARCH_MAX_PAGES)) {
         pageNo++;
         seen += cards.length;
         let fresh = 0;
         let known = 0;
         for (const raw of cards) {
-          if (added >= env.MAX_JOBS_PER_RUN) break;
+          if (added >= cap) break;
           const job = normalizeCard(raw);
           if (!job) continue;
           if (insertJob(db, job, query.searchName)) {
@@ -81,11 +97,11 @@ export async function discoverJobs(
         }
         log.info(`  Page ${pageNo}: ${cards.length} jobs, ${fresh} new${known ? `, ${known} already stored` : ''}`);
         // A page of nothing new means this search is already covered; don't dig deeper.
-        if (fresh === 0 || added >= env.MAX_JOBS_PER_RUN) break;
+        if (fresh === 0 || added >= cap || signal?.aborted) break;
         await politePause(page, env);
       }
     } catch (err) {
-      if (err instanceof RunStopped) throw err;
+      stopIfClosed(page, err);
       log.warn(`Search failed: ${describeQuery(query)}`, err);
       await saveDebugScreenshot(page, 'search');
     }
@@ -97,8 +113,9 @@ export async function fetchMissingDetails(
   page: Page,
   db: DatabaseSync,
   env: Env,
+  { scope, signal }: { scope?: JobScope; signal?: AbortSignal } = {},
 ): Promise<{ fetched: number; failed: number }> {
-  const jobs = jobsNeedingDetails(db, env.MAX_JOBS_PER_RUN);
+  const jobs = jobsNeedingDetails(db, { scope });
   let fetched = 0;
   let failed = 0;
   if (!jobs.length) return { fetched, failed };
@@ -106,13 +123,14 @@ export async function fetchMissingDetails(
   const minutes = Math.ceil((jobs.length * ((env.DELAY_MIN_MS + env.DELAY_MAX_MS) / 2 + 1_500)) / 60_000);
   log.info(`Reading ${jobs.length} job description(s), about ${minutes} min. Stopping early is safe; the rest wait for the next run.`);
   for (const [index, job] of jobs.entries()) {
+    if (signal?.aborted) break;
     await politePause(page, env);
     try {
       saveJobDetails(db, job.id, await readJobDetails(page, job.url));
       fetched++;
       log.debug(`Read ${job.title} at ${job.company}`);
     } catch (err) {
-      if (err instanceof RunStopped) throw err;
+      stopIfClosed(page, err);
       recordDetailFailure(db, job.id);
       failed++;
       log.warn(`Could not read ${job.title} at ${job.company}`, err);
@@ -121,4 +139,34 @@ export async function fetchMissingDetails(
     if ((index + 1) % 10 === 0) log.info(`  ${index + 1}/${jobs.length} read`);
   }
   return { fetched, failed };
+}
+
+// Search Naukri, sort the results into job profiles and drop obvious mismatches from the listing data,
+// then read the remaining descriptions (only those in `scope`, freshest first). Counts land in `stats`
+// as they happen, so a stopped run still reports what it did.
+export async function searchJobs(
+  page: Page,
+  db: DatabaseSync,
+  env: Env,
+  profile: Profile,
+  jobProfiles: JobProfile[],
+  queries: SearchQuery[],
+  { stats, scope, signal }: { stats: Record<string, number>; scope?: JobScope; signal?: AbortSignal },
+): Promise<void> {
+  stats.searches = queries.length;
+  log.info(`${queries.length} search(es) planned, up to ${env.SEARCH_MAX_PAGES} result page(s) each`);
+  for (const query of queries) log.debug(`  ${describeQuery(query)}`);
+
+  const { seen, added } = await discoverJobs(page, db, queries, env, signal);
+  Object.assign(stats, { seen, added });
+  log.info(`Found ${seen} jobs, ${added} new`);
+
+  const { rejected } = applyHardFilters(db, profile, jobProfiles);
+  stats.filtered = rejected;
+  if (rejected) log.info(`Filtered out ${rejected} job(s) on location or title before reading descriptions`);
+  if (signal?.aborted) return;
+
+  const { fetched, failed } = await fetchMissingDetails(page, db, env, { scope, signal });
+  Object.assign(stats, { detailsRead: fetched, detailsFailed: failed });
+  if (fetched || failed) log.info(`Descriptions read: ${fetched}${failed ? `, failed: ${failed}` : ''}`);
 }

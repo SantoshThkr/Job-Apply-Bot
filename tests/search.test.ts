@@ -5,9 +5,10 @@ import type { BrowserContext, Page } from 'playwright';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { launchBrowser } from '../src/browser/browser.ts';
 import { detailsFromJsonLd, readJobDetails } from '../src/browser/job-details.ts';
-import { buildSearchUrl, cardsFromSearchApi, searchResultPages } from '../src/browser/search.ts';
+import { buildSearchUrl, cardsFromSearchApi, droppedFilters, searchResultPages } from '../src/browser/search.ts';
 import { RunStopped } from '../src/browser/session.ts';
 import type { Profile } from '../src/config.ts';
+import type { Freshness } from '../src/domain.ts';
 import { planQueries } from '../src/jobs/discovery.ts';
 
 // Synthetic data shaped like Naukri's responses; no real postings.
@@ -27,60 +28,63 @@ const apiJob = (id: string, title: string, extra: object = {}) => ({
   ...extra,
 });
 
-const profile: Profile = {
-  name: 'Test Candidate',
-  experienceYears: 7,
-  targetRoles: ['AI Engineer'],
-  primarySkills: ['React'],
-  secondarySkills: [],
-  preferredLocations: ['Remote', 'Bangalore'],
-  minimumExperience: 6,
-  maximumExperience: 12,
-  skillAliases: {},
-};
+const profile: Pick<Profile, 'preferredLocations'> = { preferredLocations: ['Remote', 'Bangalore', 'Pune'] };
+const jobProfile = (id: string, keywords: string[]) => ({ id, name: id, keywords, skills: [], exclude: [], ai: false });
 
 describe('planQueries', () => {
-  it('splits Remote into its own filtered search and fills in profile locations', () => {
-    const queries = planQueries(
-      [
-        { name: 'AI', keywords: ['AI Engineer'], locations: ['Pune', 'Remote'] },
-        { name: 'Frontend', keywords: ['React Developer'] },
-      ],
-      profile,
-    );
+  it('searches each chosen profile’s keywords in your cities, with Remote as its own filtered search', () => {
+    const queries = planQueries([jobProfile('ai', ['AI Engineer']), jobProfile('react', ['React Developer'])], profile);
     expect(queries.map((q) => [q.searchName, q.keyword, q.locations, q.remote])).toEqual([
-      ['AI', 'AI Engineer', ['Pune'], false],
-      ['AI', 'AI Engineer', [], true],
-      ['Frontend', 'React Developer', ['Bangalore'], false],
-      ['Frontend', 'React Developer', [], true],
+      ['ai', 'AI Engineer', ['Bangalore', 'Pune'], false],
+      ['ai', 'AI Engineer', [], true],
+      ['react', 'React Developer', ['Bangalore', 'Pune'], false],
+      ['react', 'React Developer', [], true],
     ]);
-    expect(queries.every((q) => q.experience === 7)).toBe(true);
+  });
+
+  it('asks Naukri for fresh jobs only, and never filters on experience', () => {
+    const plan = (freshness: Freshness) => planQueries([jobProfile('ai', ['AI Engineer'])], profile, { freshness })[0]!;
+    expect([plan('today').jobAge, plan('24h').jobAge, plan('3d').jobAge, plan('7d').jobAge, plan('all').jobAge]).toEqual([1, 1, 3, 7, null]);
+    expect(plan('all')).not.toHaveProperty('experience');
   });
 
   it('applies command-line overrides and drops repeated searches', () => {
-    expect(planQueries([], profile, { keyword: 'LLM Engineer', location: 'Remote' })).toEqual([
-      { searchName: 'command line', keyword: 'LLM Engineer', locations: [], remote: true, experience: 7 },
+    expect(planQueries([], profile, { keywords: ['LLM Engineer'], locations: ['Remote'] })).toEqual([
+      { searchName: 'command line', keyword: 'LLM Engineer', locations: [], remote: true, jobAge: null },
     ]);
-    const repeated = planQueries(
-      [
-        { name: 'A', keywords: ['AI Engineer'], locations: ['Pune'] },
-        { name: 'B', keywords: ['ai engineer'], locations: ['pune'] },
-      ],
-      profile,
-    );
+    const repeated = planQueries([jobProfile('a', ['AI Engineer']), jobProfile('b', ['ai engineer'])], { preferredLocations: ['Pune'] });
     expect(repeated).toHaveLength(1);
   });
 });
 
 describe('buildSearchUrl', () => {
-  it('builds the URL Naukri’s search box would', () => {
-    const base = { searchName: 'x', keyword: 'React Developer', experience: 7.5 };
+  it('builds the URL Naukri’s search box would, with no experience filter', () => {
+    const base = { searchName: 'x', keyword: 'React Developer', jobAge: null };
     expect(buildSearchUrl({ ...base, locations: ['Bangalore', 'Hyderabad'], remote: false })).toBe(
-      'https://www.naukri.com/react-developer-jobs-in-bangalore?k=React+Developer&l=bangalore%2C+hyderabad&experience=7',
+      'https://www.naukri.com/react-developer-jobs-in-bangalore?k=React+Developer&l=bangalore%2C+hyderabad',
     );
-    expect(buildSearchUrl({ ...base, locations: [], remote: true })).toBe(
-      'https://www.naukri.com/react-developer-jobs?k=React+Developer&wfhType=2&experience=7',
+    expect(buildSearchUrl({ ...base, locations: [], remote: true })).toBe('https://www.naukri.com/react-developer-jobs?k=React+Developer&wfhType=2');
+  });
+
+  it('adds Naukri’s freshness filter', () => {
+    expect(buildSearchUrl({ searchName: 'x', keyword: 'React Developer', locations: ['Pune'], remote: false, jobAge: 3 })).toBe(
+      'https://www.naukri.com/react-developer-jobs-in-pune?k=React+Developer&l=pune&jobAge=3',
     );
+  });
+
+  it('writes keywords without dots, which make Naukri drop its filters', () => {
+    expect(buildSearchUrl({ searchName: 'x', keyword: 'React.js Developer', locations: [], remote: true, jobAge: 1 })).toBe(
+      'https://www.naukri.com/react-js-developer-jobs?k=React+js+Developer&wfhType=2&jobAge=1',
+    );
+  });
+});
+
+describe('droppedFilters', () => {
+  const asked = 'https://www.naukri.com/react-developer-jobs?k=React+Developer&wfhType=2&jobAge=1';
+  it('notices when Naukri’s results request leaves out a filter the search asked for', () => {
+    expect(droppedFilters(asked, 'https://www.naukri.com/jobapi/v3/search?keyword=react&wfhType=2&jobAge=1&pageNo=1')).toEqual([]);
+    expect(droppedFilters(asked, 'https://www.naukri.com/jobapi/v3/search?keyword=react+.js&pageNo=1')).toEqual(['jobAge', 'wfhType']);
+    expect(droppedFilters('https://www.naukri.com/react-developer-jobs?k=React', 'https://www.naukri.com/jobapi/v3/search?pageNo=1')).toEqual([]);
   });
 });
 
@@ -264,5 +268,17 @@ describe('Naukri pages (mocked)', () => {
     });
     const details = await readJobDetails(page, 'https://www.naukri.com/job-listings-ai-engineer-100000000001', { jsonLdWaitMs: 300 });
     expect(details.description).toBe('Job description\n\nBuild agents with LLMs.');
+    expect(details.externalUrl).toBeNull();
+  });
+
+  it('records the company site an external job sends applicants to, from Naukri’s own job data', async () => {
+    await serve((path) => {
+      if (path.startsWith('/jobapi/v4/job/')) return { body: { jobDetails: { applyRedirectUrl: 'https://careers.example.com/jobs/42' } } };
+      if (path.startsWith('/job-listings-')) {
+        return { body: `<script>fetch('/jobapi/v4/job/100000000001')</script><section><h2>Job description</h2><p>Build agents.</p></section>` };
+      }
+    });
+    const details = await readJobDetails(page, 'https://www.naukri.com/job-listings-ai-engineer-100000000001', { jsonLdWaitMs: 300 });
+    expect(details.externalUrl).toBe('https://careers.example.com/jobs/42');
   });
 });

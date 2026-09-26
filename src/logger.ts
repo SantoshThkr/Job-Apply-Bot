@@ -7,14 +7,26 @@ type Level = Exclude<keyof typeof levels, 'silent'>;
 
 let logDirReady = false;
 
+type Listener = (level: Exclude<Level, 'debug'>, line: string) => void;
+const listeners = new Set<Listener>();
+
+// Lets the dashboard server stream the same lines the terminal shows. Debug lines stay out.
+export function onLog(listener: Listener): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
 function write(level: Level, message: string, err?: unknown): void {
+  const detail = err === undefined ? '' : err instanceof Error ? err.message : String(err);
+  const line = detail ? `${message}: ${detail}` : message;
+  // Listeners get every non-debug line whatever the terminal's LOG_LEVEL.
+  if (level !== 'debug') for (const listener of listeners) listener(level, line);
+
   // Read on every call because .env is loaded after this module is imported.
   const threshold = levels[process.env.LOG_LEVEL as keyof typeof levels] ?? levels.info;
   if (levels[level] < threshold) return;
 
   const now = new Date();
-  const detail = err === undefined ? '' : err instanceof Error ? err.message : String(err);
-  const line = detail ? `${message}: ${detail}` : message;
   const label = level === 'warn' || level === 'error' ? `${level.toUpperCase()} ` : '';
   const stream = level === 'warn' || level === 'error' ? process.stderr : process.stdout;
   stream.write(`[${now.toTimeString().slice(0, 8)}] ${label}${line}\n`);

@@ -51,9 +51,10 @@ describe('parsePostedDate', () => {
   const now = new Date(2026, 8, 25, 12);
 
   it('reads epoch milliseconds, ISO dates and relative labels', () => {
-    expect(parsePostedDate(new Date(2026, 7, 26, 12).getTime())).toBe('2026-08-26');
+    expect(parsePostedDate(new Date(2026, 7, 26, 12).getTime())).toBe(new Date(2026, 7, 26, 12).toISOString());
     expect(parsePostedDate('2026-08-26')).toBe('2026-08-26');
-    expect(parsePostedDate('Just Now', now)).toBe('2026-09-25');
+    expect(parsePostedDate('Just Now', now)).toBe(now.toISOString());
+    expect(parsePostedDate('3 hours ago', now)).toBe(new Date(now.getTime() - 3 * 3_600_000).toISOString());
     expect(parsePostedDate('Today', now)).toBe('2026-09-25');
     expect(parsePostedDate('1 Day Ago', now)).toBe('2026-09-24');
     expect(parsePostedDate('30+ Days Ago', now)).toBe('2026-08-26');

@@ -1,11 +1,14 @@
 import type { MatchEvidence, SkillEvidence } from '../ai/schemas.ts';
-import type { Profile } from '../config.ts';
+import type { JobProfile, Profile } from '../config.ts';
+import type { MatchBand } from '../domain.ts';
 import { locationMatches } from './filtering.ts';
-import { skillKey, skillMatcher } from './skills.ts';
+import { mentionedIn, skillKey, skillMatcher } from './skills.ts';
 import type { WorkMode } from './normalization.ts';
 
 // The model supplies evidence; the score is always calculated here so it is reproducible and explainable.
-export const WEIGHTS = { role: 0.25, skills: 0.3, ai: 0.2, experience: 0.1, location: 0.1, other: 0.05 } as const;
+// Experience is deliberately not a component: it never keeps a job from being applied to. AI focus
+// only counts for job profiles marked `ai`, and the weights are rescaled when it doesn't.
+export const WEIGHTS = { role: 0.3, skills: 0.35, ai: 0.2, location: 0.1, other: 0.05 } as const;
 type Component = keyof typeof WEIGHTS;
 
 const ROLE_SCORES = { STRONG: 1, PARTIAL: 0.6, WEAK: 0.2, NONE: 0 } as const;
@@ -15,14 +18,15 @@ const REQUIREMENT_SCORES = { YES: 1, UNKNOWN: 0.5, NO: 0 } as const;
 const NEUTRAL = 0.5;
 const REVIEW_THRESHOLD = 60;
 
-export type MatchBand = 'HIGH_MATCH' | 'MATCH' | 'REVIEW' | 'SKIP';
 export type MatchStatus = 'SHORTLISTED' | 'REVIEW' | 'SKIPPED';
 
 export interface JobFacts {
-  experienceMin: number | null;
-  experienceMax: number | null;
   location: string | null;
   workMode: WorkMode | null;
+  // The posting's own words, to check the model's skill lists against.
+  title?: string;
+  description?: string | null;
+  skills?: string[];
 }
 
 export interface MatchResult {
@@ -34,7 +38,6 @@ export interface MatchResult {
   missingSkills: string[];
   missingPreferredSkills: string[];
   roleMatch: boolean;
-  experienceMatch: boolean | null;
   locationMatch: boolean | null;
   // Why a job that scored high enough is held at REVIEW instead of SHORTLISTED.
   holdReason: string | null;
@@ -49,14 +52,6 @@ export function bandFor(score: number): MatchBand {
   return 'SKIP';
 }
 
-export function experienceFit(years: number, min: number | null, max: number | null): number | null {
-  if (min === null && max === null) return null;
-  if (min !== null && years < min) return min - years <= 1 ? 0.5 : 0;
-  // Over-qualification is a softer mismatch than falling short.
-  if (max !== null && years > max) return years - max <= 2 ? 0.7 : 0.4;
-  return 1;
-}
-
 function dedupe(items: SkillEvidence[], alreadyListed: Set<string>): SkillEvidence[] {
   return items.filter((item) => {
     const key = skillKey(item.skill);
@@ -66,16 +61,27 @@ function dedupe(items: SkillEvidence[], alreadyListed: Set<string>): SkillEviden
   });
 }
 
+function weightedScore(breakdown: Record<Component, number>, countAi: boolean): number {
+  const components = (Object.keys(WEIGHTS) as Component[]).filter((key) => countAi || key !== 'ai');
+  const total = components.reduce((sum, key) => sum + WEIGHTS[key], 0);
+  const weighted = components.reduce((sum, key) => sum + WEIGHTS[key] * breakdown[key], 0) / total;
+  // toFixed first, so an exact .5 always rounds up instead of depending on floating-point noise.
+  return Math.round(Number((weighted * 100).toFixed(6)));
+}
+
 export function scoreMatch({
   evidence,
   job,
   profile,
   minMatchScore,
+  jobProfiles = [],
 }: {
   evidence: MatchEvidence;
   job: JobFacts;
   profile: Profile;
   minMatchScore: number;
+  // The job profiles the job belongs to. It gets the better score of an AI and a non-AI profile.
+  jobProfiles?: Pick<JobProfile, 'ai'>[];
 }): MatchResult {
   // Coverage is decided here from the job's skill names, never from the model's candidateSkill claim,
   // so a model mapping "LangGraph" to "Python" can't inflate the score.
@@ -83,19 +89,21 @@ export function scoreMatch({
   const covered = (item: SkillEvidence) => coveredBy(item.skill) !== null;
   const coverage = (items: SkillEvidence[]) => items.filter(covered).length / items.length;
 
+  // Only skills the posting itself names count. A small model sometimes pads the lists with the
+  // candidate's own skills; without a description there is nothing to check them against.
+  const named = job.description ? mentionedIn([job.title ?? '', job.description, ...(job.skills ?? [])].join('\n')) : () => true;
+  const fromPosting = (items: SkillEvidence[]) => items.filter((item) => named(item.skill));
+
   const listed = new Set<string>();
-  const required = dedupe(evidence.requiredSkills, listed);
-  const preferred = dedupe(evidence.preferredSkills, listed);
-  const optional = dedupe(evidence.optionalSkills, listed);
+  const required = dedupe(fromPosting(evidence.requiredSkills), listed);
+  const preferred = dedupe(fromPosting(evidence.preferredSkills), listed);
+  const optional = dedupe(fromPosting(evidence.optionalSkills), listed);
 
   let skills = NEUTRAL;
   if (required.length && preferred.length) skills = 0.8 * coverage(required) + 0.2 * coverage(preferred);
   else if (required.length) skills = coverage(required);
   else if (preferred.length) skills = coverage(preferred);
 
-  const minimums = [job.experienceMin, evidence.statedMinimumYears].filter((n): n is number => n !== null);
-  const minimumYears = minimums.length ? Math.max(...minimums) : null;
-  const experience = experienceFit(profile.experienceYears, minimumYears, job.experienceMax);
   const location = locationMatches(job, profile.preferredLocations);
   const other = evidence.otherRequirements.length
     ? evidence.otherRequirements.reduce((sum, r) => sum + REQUIREMENT_SCORES[r.met], 0) / evidence.otherRequirements.length
@@ -105,21 +113,15 @@ export function scoreMatch({
     role: ROLE_SCORES[evidence.roleRelevance],
     skills,
     ai: AI_FOCUS_SCORES[evidence.aiFocus],
-    experience: experience ?? NEUTRAL,
     location: location === null ? NEUTRAL : Number(location),
     other,
   };
-  const weighted = (Object.keys(WEIGHTS) as Component[]).reduce((sum, key) => sum + WEIGHTS[key] * breakdown[key], 0);
-  const score = Math.round(weighted * 100);
+  const aiVariants = new Set(jobProfiles.length ? jobProfiles.map((p) => p.ai) : [false]);
+  const score = Math.max(...[...aiVariants].map((countAi) => weightedScore(breakdown, countAi)));
 
-  // Experience and location are only 20% of the score, so a strong role can outscore a real blocker.
-  // The score stays as calculated; the job just isn't shortlisted automatically.
-  const holdReason =
-    minimumYears !== null && minimumYears - profile.experienceYears >= 2
-      ? `Needs ${minimumYears}+ years; you have ${profile.experienceYears}`
-      : location === false
-        ? `Not in your preferred locations (${job.location})`
-        : null;
+  // Location is only 10% of the score, so a strong role elsewhere can outscore it. The score stays as
+  // calculated; the job just isn't shortlisted automatically.
+  const holdReason = location === false ? `Not in your preferred locations (${job.location})` : null;
   let status: MatchStatus = score >= minMatchScore ? 'SHORTLISTED' : score >= REVIEW_THRESHOLD ? 'REVIEW' : 'SKIPPED';
   if (status === 'SHORTLISTED' && holdReason) status = 'REVIEW';
 
@@ -136,7 +138,6 @@ export function scoreMatch({
     missingSkills: required.filter((s) => !covered(s)).map((s) => s.skill),
     missingPreferredSkills: preferred.filter((s) => !covered(s)).map((s) => s.skill),
     roleMatch: evidence.roleRelevance === 'STRONG' || evidence.roleRelevance === 'PARTIAL',
-    experienceMatch: experience === null ? null : experience === 1,
     locationMatch: location,
     redFlags: evidence.redFlags.map((f) => f.trim()).filter(Boolean),
     reason: evidence.reason.trim(),

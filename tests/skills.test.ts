@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { skillKey, skillMatcher } from '../src/jobs/skills.ts';
+import { mentionedIn, skillKey, skillMatcher } from '../src/jobs/skills.ts';
 import { testProfile } from './fixtures.ts';
 
 describe('skillKey', () => {
@@ -50,5 +50,28 @@ describe('skillMatcher', () => {
     const configured = skillMatcher({ ...testProfile, skillAliases: { 'Node.js': ['Express', 'NestJS'] } });
     expect(configured('Express.js')).toBe('Node.js');
     expect(configured('NestJS')).toBe('Node.js');
+  });
+});
+
+describe('mentionedIn', () => {
+  const named = mentionedIn(
+    'Senior Frontend Engineer. Strong ReactJS skills (Redux) and HTML5/CSS3. Build RESTful services on Postgres. ' +
+      'Use RxJS for reactive data flows. Angular is a plus.',
+  );
+
+  it('finds a skill under its spelling variants and built-in aliases', () => {
+    for (const skill of ['React', 'React.js', 'Redux', 'Redux Toolkit', 'HTML', 'CSS3', 'REST APIs', 'PostgreSQL', 'Frontend']) {
+      expect(named(skill), skill).toBe(true);
+    }
+    expect(mentionedIn('Experience with PostgreSQL')('Postgres')).toBe(true);
+  });
+
+  it('accepts a reworded phrase whose words are all in the posting, and any listed alternative', () => {
+    expect(named('Reactive data flows with RxJS')).toBe(true);
+    expect(named('Vue/Angular')).toBe(true);
+  });
+
+  it('rejects a skill the posting never names', () => {
+    for (const skill of ['Kubernetes', 'Docker', 'React Native', 'Micro Frontends', 'Vue']) expect(named(skill), skill).toBe(false);
   });
 });

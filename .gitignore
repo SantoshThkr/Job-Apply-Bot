@@ -29,3 +29,8 @@ screenshots/
 traces/
 test-results/
 playwright-report/
+
+# Dashboard build output
+.next/
+next-env.d.ts
+*.tsbuildinfo

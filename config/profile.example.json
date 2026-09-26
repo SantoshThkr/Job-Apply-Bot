@@ -1,10 +1,6 @@
 {
   "name": "YOUR_NAME",
   "experienceYears": 5,
-  "targetRoles": [
-    "Senior Frontend Engineer",
-    "Full Stack Engineer"
-  ],
   "primarySkills": [
     "React",
     "TypeScript",
@@ -18,8 +14,6 @@
     "Remote",
     "Bangalore"
   ],
-  "minimumExperience": 4,
-  "maximumExperience": 10,
   "skillAliases": {
     "Node.js": [
       "Express"

@@ -1,6 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
-import type { MatchBand, MatchResult } from '../jobs/scoring.ts';
-import type { JobStatus } from './jobs.ts';
+import type { JobStatus, MatchBand } from '../domain.ts';
+import type { MatchResult } from '../jobs/scoring.ts';
 
 export function cachedEvidence(db: DatabaseSync, cacheKey: string): string | undefined {
   const row = db

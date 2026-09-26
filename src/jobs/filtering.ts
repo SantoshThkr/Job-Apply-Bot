@@ -1,16 +1,15 @@
-import type { Profile } from '../config.ts';
+import type { JobProfile, Profile } from '../config.ts';
 import { canonicalLocation, splitLocations, type WorkMode } from './normalization.ts';
 import { skillMatcher } from './skills.ts';
 
 // Stage 1 of matching: cheap, deterministic checks on the search-card data, so obviously wrong jobs
 // never cost a page load or an AI call. Deliberately lenient: anything plausible goes on to the AI.
+// Experience is never checked; jobs with any experience range stay in.
 
 export interface FilterableJob {
   title: string;
   location: string | null;
   workMode: WorkMode | null;
-  experienceMin: number | null;
-  experienceMax: number | null;
   skills: string[];
 }
 
@@ -45,9 +44,10 @@ const GENERIC_TITLE_WORDS = new Set(
 
 const TITLE_SYNONYMS: Record<string, string[]> = {
   ai: ['artificial intelligence', 'genai', 'gen ai', 'aiml', 'ml', 'machine learning', 'llm', 'agentic', 'agent', 'agents', 'prompt'],
-  frontend: ['front end', 'ui', 'web'],
-  full: ['fullstack'],
+  frontend: ['front end', 'ui'],
+  'full stack': ['fullstack'],
   react: ['reactjs'],
+  'react js': ['reactjs'],
   angular: ['angularjs'],
   'node js': ['nodejs'],
   'next js': ['nextjs'],
@@ -59,40 +59,44 @@ const words = (text: string) =>
     .replace(/[^a-z0-9+#]+/g, ' ')
     .trim();
 
-function titleTerms(profile: Profile): string[] {
-  const roleWords = profile.targetRoles.flatMap((role) => words(role).split(' ')).filter((w) => !GENERIC_TITLE_WORDS.has(w));
-  const skillPhrases = [...profile.primarySkills, ...profile.secondarySkills].map(words);
-  const terms = [...roleWords, ...skillPhrases];
-  return [...new Set([...terms, ...terms.flatMap((term) => TITLE_SYNONYMS[term] ?? [])])].filter(Boolean);
+// What a title has to name to belong to a profile: its keywords without the generic words, and its skills.
+function titleTerms(profile: JobProfile): string[] {
+  const keywords = profile.keywords.map((keyword) =>
+    words(keyword)
+      .split(' ')
+      .filter((w) => !GENERIC_TITLE_WORDS.has(w))
+      .join(' '),
+  );
+  const terms = [...keywords, ...profile.skills.map(words)].filter(Boolean);
+  return [...new Set([...terms, ...terms.flatMap((term) => TITLE_SYNONYMS[term] ?? [])])];
 }
 
-function titleIsRelevant(title: string, skills: string[], profile: Profile): boolean {
-  const normalized = ` ${words(title)} `;
-  if (titleTerms(profile).some((term) => normalized.includes(` ${term} `))) return true;
+export function profileMatches(job: Pick<FilterableJob, 'title' | 'skills'>, profile: JobProfile): boolean {
+  const title = ` ${words(job.title)} `;
+  const names = (phrase: string) => title.includes(` ${phrase} `);
+  if (profile.exclude.some((phrase) => names(words(phrase)))) return false;
+  if (titleTerms(profile).some(names)) return true;
 
   // "Senior Software Engineer" says nothing either way; let the listed skills decide.
-  const meaningful = normalized
+  const meaningful = title
     .trim()
     .split(' ')
     .filter((w) => w && !GENERIC_TITLE_WORDS.has(w) && !/^\d+$/.test(w));
   if (meaningful.length > 0) return false;
-  const coveredBy = skillMatcher(profile);
-  return skills.filter((s) => coveredBy(s)).length >= 2;
+  const coveredBy = skillMatcher({ primarySkills: profile.skills, secondarySkills: [], skillAliases: {} });
+  return new Set(job.skills.map(coveredBy).filter(Boolean)).size >= 2;
 }
 
-// Returns why the job is rejected, or null when it should go on to AI analysis.
-export function hardFilterReason(job: FilterableJob, profile: Profile): string | null {
-  if (job.experienceMin !== null && job.experienceMin > profile.maximumExperience) {
-    return `Needs ${job.experienceMin}+ years; your maximum is ${profile.maximumExperience}`;
-  }
-  if (job.experienceMax !== null && job.experienceMax < profile.minimumExperience) {
-    return `Aimed at up to ${job.experienceMax} years; your minimum is ${profile.minimumExperience}`;
-  }
-  if (locationMatches(job, profile.preferredLocations) === false) {
+// Ids of the profiles a job belongs to, in configuration order.
+export function matchingProfiles(job: Pick<FilterableJob, 'title' | 'skills'>, profiles: JobProfile[]): string[] {
+  return profiles.filter((profile) => profileMatches(job, profile)).map((profile) => profile.id);
+}
+
+// Returns why the job is set aside, or null when it should go on to AI analysis.
+export function hardFilterReason(job: FilterableJob, candidate: Pick<Profile, 'preferredLocations'>, profiles: string[]): string | null {
+  if (locationMatches(job, candidate.preferredLocations) === false) {
     return `Not in your preferred locations (${job.location})`;
   }
-  if (!titleIsRelevant(job.title, job.skills, profile)) {
-    return 'Title does not match your target roles or skills';
-  }
+  if (!profiles.length) return 'Title matches none of your job profiles';
   return null;
 }

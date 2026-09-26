@@ -1,7 +1,7 @@
-import type { Page } from 'playwright';
+import type { Page, Response } from 'playwright';
 import { z } from 'zod';
 import { htmlToText, parsePostedDate, type JobDetails } from '../jobs/normalization.ts';
-import { DETAIL_SELECTORS } from './selectors.ts';
+import { DETAIL_SELECTORS, JOB_API } from './selectors.ts';
 import { assertUsable } from './session.ts';
 
 const stringOrList = z.union([z.string(), z.array(z.string())]);
@@ -42,10 +42,29 @@ export function detailsFromJsonLd(blocks: string[]): JobDetails | null {
   return null;
 }
 
-export async function readJobDetails(page: Page, url: string, { jsonLdWaitMs = 15_000 } = {}): Promise<JobDetails> {
-  await page.goto(url, { waitUntil: 'domcontentloaded' });
-  await assertUsable(page);
+const jobApiSchema = z.object({ jobDetails: z.object({ applyRedirectUrl: z.string().optional() }) });
 
+// The description, plus the company's own application URL when Naukri sends applicants there.
+export async function readJobDetails(
+  page: Page,
+  url: string,
+  { jsonLdWaitMs = 15_000 } = {},
+): Promise<JobDetails & { externalUrl: string | null }> {
+  let api: Promise<unknown> = Promise.resolve(null);
+  const onResponse = (res: Response) => {
+    if (JOB_API.test(res.url())) api = res.json().catch(() => null);
+  };
+  page.on('response', onResponse);
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await assertUsable(page);
+    return await readPage(page, jsonLdWaitMs, () => api);
+  } finally {
+    page.off('response', onResponse);
+  }
+}
+
+async function readPage(page: Page, jsonLdWaitMs: number, api: () => Promise<unknown>): Promise<JobDetails & { externalUrl: string | null }> {
   await page
     .waitForFunction(
       (selector) => Array.from(document.querySelectorAll(selector)).some((s) => s.textContent?.includes('JobPosting')),
@@ -53,8 +72,10 @@ export async function readJobDetails(page: Page, url: string, { jsonLdWaitMs = 1
       { timeout: jsonLdWaitMs },
     )
     .catch(() => {});
+  const parsedApi = jobApiSchema.safeParse(await api());
+  const externalUrl = (parsedApi.success && parsedApi.data.jobDetails.applyRedirectUrl) || null;
   const details = detailsFromJsonLd(await page.locator(DETAIL_SELECTORS.jsonLd).allTextContents());
-  if (details) return details;
+  if (details) return { ...details, externalUrl };
 
   const description = await page
     .getByRole('heading', { name: DETAIL_SELECTORS.descriptionHeading, exact: true })
@@ -62,5 +83,5 @@ export async function readJobDetails(page: Page, url: string, { jsonLdWaitMs = 1
     .innerText({ timeout: 5_000 })
     .catch(() => '');
   if (!description.trim()) throw new Error('No job description on the page; the posting may have expired');
-  return { description: description.trim(), skills: [], employmentType: null, postedAt: null, workMode: null };
+  return { description: description.trim(), skills: [], employmentType: null, postedAt: null, workMode: null, externalUrl };
 }

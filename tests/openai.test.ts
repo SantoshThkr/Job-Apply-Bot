@@ -6,6 +6,7 @@ import { evidence, testProfile } from './fixtures.ts';
 // Every request goes to a mocked fetch; these tests never reach OpenAI.
 
 const job: JobForAnalysis = {
+  targetRoles: ['AI Engineer'],
   title: 'AI Engineer',
   company: 'Acme',
   location: 'Bengaluru',

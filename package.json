@@ -2,7 +2,7 @@
   "name": "naukri-job-bot",
   "version": "0.1.0",
   "private": true,
-  "description": "Local Chrome automation that finds and pre-fills Naukri applications, stopping before submit.",
+  "description": "Local Chrome automation that finds, scores and applies to Naukri jobs, with a local dashboard. Never submits unless you turn on auto-submit.",
   "type": "module",
   "engines": {
     "node": ">=22.18.0"
@@ -13,7 +13,11 @@
     "search": "node --disable-warning=ExperimentalWarning src/cli.ts search",
     "analyze": "node --disable-warning=ExperimentalWarning src/cli.ts analyze",
     "dry-run": "node --disable-warning=ExperimentalWarning src/cli.ts dry-run",
+    "apply": "node --disable-warning=ExperimentalWarning src/cli.ts apply",
     "status": "node --disable-warning=ExperimentalWarning src/cli.ts status",
+    "report": "node --disable-warning=ExperimentalWarning src/cli.ts report",
+    "server": "node --disable-warning=ExperimentalWarning src/cli.ts server",
+    "web": "npm --prefix web run dev",
     "typecheck": "tsc",
     "test": "LOG_LEVEL=silent NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest run --testTimeout=30000",
     "scan-secrets": "node scripts/scan-secrets.ts",
@@ -25,6 +29,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.13.6",
+    "happy-dom": "^20.14.5",
     "typescript": "^7.0.2",
     "vitest": "^5.0.1"
   }

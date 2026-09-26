@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { bandFor, experienceFit, scoreMatch, type JobFacts } from '../src/jobs/scoring.ts';
+import { bandFor, scoreMatch, type JobFacts } from '../src/jobs/scoring.ts';
 import { evidence, skills, testProfile } from './fixtures.ts';
 
-const bangaloreHybrid: JobFacts = { experienceMin: 6, experienceMax: 10, location: 'Hybrid - Bengaluru', workMode: 'Hybrid' };
-const score = (ev: ReturnType<typeof evidence>, job: Partial<JobFacts> = {}, minMatchScore = 75) =>
-  scoreMatch({ evidence: ev, job: { ...bangaloreHybrid, ...job }, profile: testProfile, minMatchScore });
+const bangaloreHybrid: JobFacts = { location: 'Hybrid - Bengaluru', workMode: 'Hybrid' };
+const AI_PROFILE = [{ ai: true }];
+const FRONTEND_PROFILE = [{ ai: false }];
+const score = (ev: ReturnType<typeof evidence>, job: Partial<JobFacts> = {}, minMatchScore = 75, jobProfiles = AI_PROFILE) =>
+  scoreMatch({ evidence: ev, job: { ...bangaloreHybrid, ...job }, profile: testProfile, minMatchScore, jobProfiles });
 
-// Weights: role 25, skills 30, AI focus 20, experience 10, location 10, other requirements 5.
+// Weights: role 30, skills 35, AI focus 20, location 10, other requirements 5. For a profile that isn't
+// about AI, the AI share drops out and the rest is divided by 0.8. Experience is not a component.
 // Each expected score below is worked out by hand from those weights.
 describe('scoreMatch on realistic postings', () => {
   const fullStackAi = evidence({
@@ -15,22 +18,24 @@ describe('scoreMatch on realistic postings', () => {
   });
 
   it('senior full stack AI engineer with React, Python, FastAPI and RAG', () => {
-    // skills 0.8 × 6/6 + 0.2 × 1/2 = 0.9 → 25 + 27 + 20 + 10 + 10 + 5
+    // skills 0.8 × 6/6 + 0.2 × 1/2 = 0.9 → 30 + 31.5 + 20 + 10 + 5 = 96.5
     const result = score(fullStackAi);
     expect(result).toMatchObject({ score: 97, band: 'HIGH_MATCH', status: 'SHORTLISTED', missingSkills: [], missingPreferredSkills: ['LangGraph'] });
     expect(result.matchedSkills).toEqual(['React', 'TypeScript', 'Python', 'FastAPI', 'RAG', 'LLM APIs', 'Docker']);
   });
 
-  it('senior React developer with no AI work tops out at MATCH', () => {
-    const result = score(
-      evidence({ aiFocus: 'NONE', requiredSkills: skills(['React', 'React'], ['TypeScript', 'TypeScript'], ['JavaScript', 'JavaScript'], ['Next.js', 'Next.js']) }),
-      { location: 'Pune', workMode: 'Office', experienceMin: 5, experienceMax: 9 },
-    );
-    expect(result).toMatchObject({ score: 80, band: 'MATCH', status: 'SHORTLISTED' });
+  it('a React role with no AI work tops out at MATCH for the AI profile, and scores in full for a frontend one', () => {
+    const react = evidence({ aiFocus: 'NONE', requiredSkills: skills(['React', 'React'], ['TypeScript', 'TypeScript'], ['JavaScript', 'JavaScript'], ['Next.js', 'Next.js']) });
+    const pune = { location: 'Pune', workMode: 'Office' } as const;
+    // AI profile: 30 + 35 + 0 + 10 + 5; frontend profile: (30 + 35 + 10 + 5) / 0.8
+    expect(score(react, pune)).toMatchObject({ score: 80, band: 'MATCH', status: 'SHORTLISTED' });
+    expect(score(react, pune, 75, FRONTEND_PROFILE)).toMatchObject({ score: 100, band: 'HIGH_MATCH' });
+    // In both kinds of profile, the job gets the better of the two.
+    expect(score(react, pune, 75, [{ ai: true }, { ai: false }]).score).toBe(100);
   });
 
   it('Java and Spring Boot full stack role with an AI mention', () => {
-    // role 0.2, AI 0.3, skills 1/5 → 5 + 6 + 6 + 10 + 10 + 5
+    // role 0.2, AI 0.3, skills 1/5 → 6 + 7 + 6 + 10 + 5
     const result = score(
       evidence({
         roleRelevance: 'WEAK',
@@ -38,11 +43,11 @@ describe('scoreMatch on realistic postings', () => {
         requiredSkills: skills(['Java', null], ['Spring Boot', null], ['Microservices', null], ['Angular', 'Angular'], ['SQL', null]),
       }),
     );
-    expect(result).toMatchObject({ score: 42, band: 'SKIP', status: 'SKIPPED', missingSkills: ['Java', 'Spring Boot', 'Microservices', 'SQL'] });
+    expect(result).toMatchObject({ score: 34, band: 'SKIP', status: 'SKIPPED', missingSkills: ['Java', 'Spring Boot', 'Microservices', 'SQL'] });
   });
 
   it('data scientist role training ML models', () => {
-    // skills 0.8 × 1/5 + 0.2 × 1/1 = 0.36; unmet degree requirement → other 0
+    // skills 0.8 × 1/5 + 0.2 × 1/1 = 0.36; unmet degree requirement → other 0 → 6 + 12.6 + 20 + 10 + 0
     const result = score(
       evidence({
         roleRelevance: 'WEAK',
@@ -51,11 +56,12 @@ describe('scoreMatch on realistic postings', () => {
         otherRequirements: [{ requirement: "Master's degree in Statistics", met: 'NO' }],
       }),
     );
-    expect(result).toMatchObject({ score: 56, band: 'SKIP', status: 'SKIPPED' });
+    expect(result).toMatchObject({ score: 49, band: 'SKIP', status: 'SKIPPED' });
   });
 
   it('GenAI role where the model over-claims skills the profile does not list', () => {
     // "LangGraph" and "Kubernetes" are not in the profile, so those claims are ignored: skills 0.8 × 3/4 = 0.6
+    // → 30 + 21 + 20 + 10 + 5
     const result = score(
       evidence({
         requiredSkills: skills(['Python', 'Python'], ['LangGraph', 'LangGraph'], ['RAG', 'RAG'], ['FastAPI', 'FastAPI']),
@@ -63,24 +69,23 @@ describe('scoreMatch on realistic postings', () => {
       }),
       { location: 'Remote', workMode: 'Remote' },
     );
-    expect(result).toMatchObject({ score: 88, band: 'MATCH', missingSkills: ['LangGraph'], missingPreferredSkills: ['Kubernetes'] });
+    expect(result).toMatchObject({ score: 86, band: 'MATCH', missingSkills: ['LangGraph'], missingPreferredSkills: ['Kubernetes'] });
   });
 
-  it('senior Angular developer missing one required library lands in REVIEW', () => {
-    const result = score(
-      evidence({ aiFocus: 'NONE', requiredSkills: skills(['Angular', 'Angular'], ['TypeScript', 'TypeScript'], ['RxJS', null]) }),
-      { location: 'Hyderabad', workMode: 'Office' },
-    );
-    expect(result).toMatchObject({ score: 70, band: 'REVIEW', status: 'REVIEW', holdReason: null });
+  it('senior Angular developer missing one required library: REVIEW for the AI profile, shortlisted for Angular', () => {
+    const angular = evidence({ aiFocus: 'NONE', requiredSkills: skills(['Angular', 'Angular'], ['TypeScript', 'TypeScript'], ['RxJS', null]) });
+    const hyderabad = { location: 'Hyderabad', workMode: 'Office' } as const;
+    // skills 2/3: 30 + 23.3 + 0 + 10 + 5 = 68.3, or 68.3 / 0.8 = 85.4 without the AI share
+    expect(score(angular, hyderabad)).toMatchObject({ score: 68, band: 'REVIEW', status: 'REVIEW', holdReason: null });
+    expect(score(angular, hyderabad, 75, FRONTEND_PROFILE)).toMatchObject({ score: 85, band: 'MATCH', status: 'SHORTLISTED' });
   });
 
-  it('holds a well-matched role that needs far more experience', () => {
-    // stated 12+ years beats the card's 10; 5 years short → experience 0 → 15 + 30 + 20 + 0 + 10 + 5
-    const result = score(
-      evidence({ roleRelevance: 'PARTIAL', statedMinimumYears: 12, requiredSkills: skills(['Python', 'Python'], ['LLM', 'LLM'], ['Agents', 'AI Agents']) }),
-      { experienceMin: 10, experienceMax: 15 },
-    );
-    expect(result).toMatchObject({ score: 80, band: 'MATCH', status: 'REVIEW', experienceMatch: false, holdReason: 'Needs 12+ years; you have 7' });
+  it('never holds back or marks down a role for the experience it asks for', () => {
+    // role 0.6 → 18 + 35 + 20 + 10 + 5, whatever the posting says about years
+    const ask = (statedMinimumYears: number | null) =>
+      score(evidence({ roleRelevance: 'PARTIAL', statedMinimumYears, requiredSkills: skills(['Python', 'Python'], ['LLM', 'LLM'], ['Agents', 'AI Agents']) }));
+    expect(ask(12)).toMatchObject({ score: 88, band: 'MATCH', status: 'SHORTLISTED', holdReason: null });
+    expect([ask(0), ask(1), ask(20), ask(null)].map((r) => r.score)).toEqual([88, 88, 88, 88]);
   });
 
   it('holds a strong role outside the preferred locations', () => {
@@ -94,20 +99,13 @@ describe('scoreMatch on realistic postings', () => {
     });
   });
 
-  it('vague posting with nothing concrete scores neutral and is skipped', () => {
-    // skills, experience and location unknown → 0.5 each: 15 + 15 + 14 + 5 + 5 + 5
+  it('vague posting with nothing concrete scores neutral and is not shortlisted', () => {
+    // skills and location unknown → 0.5 each: 18 + 17.5 + 14 + 5 + 5 = 59.5
     const result = score(evidence({ roleRelevance: 'PARTIAL', aiFocus: 'SIGNIFICANT', redFlags: ['Vague, copy-pasted description'] }), {
-      experienceMin: null,
-      experienceMax: null,
       location: null,
       workMode: null,
     });
-    expect(result).toMatchObject({ score: 59, band: 'SKIP', status: 'SKIPPED', redFlags: ['Vague, copy-pasted description'] });
-  });
-
-  it('slightly over-qualified candidate is still shortlisted', () => {
-    const result = score(evidence({ requiredSkills: skills(['React', 'React']) }), { experienceMin: 3, experienceMax: 6 });
-    expect(result).toMatchObject({ score: 97, status: 'SHORTLISTED', experienceMatch: false });
+    expect(result).toMatchObject({ score: 60, band: 'REVIEW', status: 'REVIEW', redFlags: ['Vague, copy-pasted description'] });
   });
 
   it('reports red flags without changing the score', () => {
@@ -137,6 +135,22 @@ describe('scoreMatch on realistic postings', () => {
     expect(result.missingSkills).toEqual(['LangGraph', 'CrewAI']);
   });
 
+  it('drops skills the posting never names, which a small model copies from the candidate profile', () => {
+    const posting = { title: 'React Developer', description: 'Build React and TypeScript screens. Node.js APIs are a plus.', skills: ['React'] };
+    const padded = evidence({
+      requiredSkills: skills(['React', 'React'], ['TypeScript', 'TypeScript'], ['Kubernetes', null]),
+      preferredSkills: skills(['Node.js', 'Node.js'], ['LangGraph', null]),
+      optionalSkills: skills(['PostgreSQL', 'PostgreSQL'], ['Docker', 'Docker']),
+    });
+    const result = score(padded, posting);
+    expect(result.matchedSkills).toEqual(['React', 'TypeScript', 'Node.js']);
+    expect(result.missingSkills).toEqual([]);
+    expect(result.missingPreferredSkills).toEqual([]);
+    expect(result.breakdown.skills).toBe(1);
+    // Without a description there is nothing to check against, so the lists are taken as given.
+    expect(score(padded).missingSkills).toEqual(['Kubernetes']);
+  });
+
   it('counts a skill listed twice only once', () => {
     const result = score(
       evidence({
@@ -164,13 +178,7 @@ describe('scoring helpers', () => {
     ]);
   });
 
-  it('rates experience fit', () => {
-    expect(experienceFit(7, 6, 10)).toBe(1);
-    expect(experienceFit(7, 8, 12)).toBe(0.5);
-    expect(experienceFit(7, 10, 15)).toBe(0);
-    expect(experienceFit(7, 3, 5)).toBe(0.7);
-    expect(experienceFit(7, 1, 3)).toBe(0.4);
-    expect(experienceFit(7, 10, null)).toBe(0);
-    expect(experienceFit(7, null, null)).toBeNull();
+  it('reports the components without experience', () => {
+    expect(Object.keys(score(evidence()).breakdown)).toEqual(['role', 'skills', 'ai', 'location', 'other']);
   });
 });

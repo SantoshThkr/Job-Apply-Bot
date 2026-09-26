@@ -1,0 +1,46 @@
+[
+  {
+    "id": "frontend",
+    "name": "Frontend Developer",
+    "keywords": ["Frontend Developer", "Frontend Engineer", "UI Developer"],
+    "skills": ["JavaScript", "TypeScript", "React", "Angular", "Vue", "HTML", "CSS"]
+  },
+  {
+    "id": "react",
+    "name": "React.js Developer",
+    "keywords": ["React Developer", "React.js Developer"],
+    "skills": ["React", "Next.js", "Redux"]
+  },
+  {
+    "id": "angular",
+    "name": "Angular Developer",
+    "keywords": ["Angular Developer"],
+    "skills": ["Angular", "RxJS", "NgRx"]
+  },
+  {
+    "id": "web",
+    "name": "Web Developer",
+    "keywords": ["Web Developer", "Web Application Developer"],
+    "skills": ["JavaScript", "HTML", "CSS"]
+  },
+  {
+    "id": "fullstack",
+    "name": "Full Stack Developer",
+    "keywords": ["Full Stack Developer", "Full Stack Engineer", "MERN Stack Developer"],
+    "skills": ["Node.js", "Next.js", "MERN", "MEAN", "GraphQL"]
+  },
+  {
+    "id": "fullstack-ai",
+    "name": "Full Stack AI Engineer",
+    "keywords": ["Full Stack AI Engineer", "Generative AI Engineer", "AI Engineer", "LLM Engineer"],
+    "skills": ["OpenAI", "LLM", "RAG", "Generative AI", "AI Agents", "LangChain", "Prompt Engineering", "Embeddings", "Vector Database"],
+    "ai": true
+  },
+  {
+    "id": "broad",
+    "name": "All / Broad Software & Web",
+    "keywords": ["Software Engineer", "Software Developer", "Web Developer", "Frontend Developer", "Full Stack Developer"],
+    "skills": ["JavaScript", "TypeScript", "React", "Angular", "Vue", "Node.js", "Python", "HTML", "CSS"],
+    "exclude": ["Java", "Spring", ".NET", "C#", "DevOps", "SRE", "Data Engineer", "Data Engineering", "Data Analyst", "SAP", "Salesforce", "Mainframe", "QA", "Tester", "Testing"]
+  }
+]

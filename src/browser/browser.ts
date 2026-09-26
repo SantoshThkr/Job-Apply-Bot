@@ -8,10 +8,13 @@ export async function launchBrowser({
   headless,
   channel,
   profileDir = paths.browserProfile,
+  handleSignals = true,
 }: {
   headless: boolean;
   channel: 'chrome' | 'chromium';
   profileDir?: string;
+  // False when the caller closes Chrome itself on Ctrl+C (the dashboard server stops runs first).
+  handleSignals?: boolean;
 }): Promise<BrowserContext> {
   mkdirSync(profileDir, { recursive: true });
 
@@ -22,6 +25,9 @@ export async function launchBrowser({
       headless,
       // Use the real window size instead of Playwright's fixed 1280x720 viewport.
       viewport: null,
+      handleSIGINT: handleSignals,
+      handleSIGTERM: handleSignals,
+      handleSIGHUP: handleSignals,
     });
   } catch (err) {
     if (/ProcessSingleton|SingletonLock|already in use/i.test(String(err))) {
@@ -53,6 +59,17 @@ export async function saveDebugScreenshot(page: Page, label: string): Promise<vo
     const file = join(paths.debug, `${new Date().toISOString().replace(/[:.]/g, '-')}-${label}.png`);
     await page.screenshot({ path: file });
     log.info(`Screenshot saved: ${relative(ROOT, file)}`);
+  } catch (err) {
+    log.debug(`Could not save screenshot: ${(err as Error).message}`);
+  }
+}
+
+// One screenshot per application step (DEBUG_SCREENSHOTS=true), grouped by run in data/debug/<run id>/.
+export async function saveStepScreenshot(page: Page, runId: string, label: string): Promise<void> {
+  try {
+    const dir = join(paths.debug, runId);
+    mkdirSync(dir, { recursive: true });
+    await page.screenshot({ path: join(dir, `${label.replace(/[^\w.-]+/g, '-')}.png`) });
   } catch (err) {
     log.debug(`Could not save screenshot: ${(err as Error).message}`);
   }

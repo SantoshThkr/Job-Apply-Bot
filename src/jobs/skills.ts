@@ -48,7 +48,42 @@ const BUILT_IN_ALIASES: Record<string, string[]> = {
   'Micro Frontends': ['Micro-Frontends', 'Microfrontends', 'Micro Frontend'],
   'Redux Toolkit': ['Redux', 'RTK'],
   'Apollo Client': ['Apollo', 'Apollo GraphQL'],
+  'Tailwind CSS': ['Tailwind'],
+  'Material UI': ['MUI'],
 };
+
+// "HTML5" and "HTML", "CSS3" and "CSS" name the same skill.
+const withoutVersion = (key: string) => (/^[a-z]+\d+$/.test(key) ? [key, key.replace(/\d+$/, '')] : [key]);
+
+// Each built-in skill with its other names, reachable from any of them.
+const ALIAS_GROUPS = new Map<string, string[]>();
+for (const [skill, aliases] of Object.entries(BUILT_IN_ALIASES)) {
+  const keys = [skill, ...aliases].map(skillKey);
+  for (const key of keys) ALIAS_GROUPS.set(key, keys);
+}
+
+const words = (text: string) => text.replace(/[()[\]{}/|,;:!?"'•]/g, ' ').split(/\s+/).filter(Boolean);
+
+// Returns a function that tells whether the posting names a skill, under any spelling skillKey treats
+// as equal or a built-in alias, so "Experience with React.js (Redux)" names both React and Redux. A
+// phrase of several words also counts when each of its words is in the posting: the model rewords
+// requirements ("Reactive data flows with RxJS") and sometimes copies whole sentences.
+export function mentionedIn(text: string): (skill: string) => boolean {
+  const posting = words(text);
+  const keys = new Set<string>();
+  for (let i = 0; i < posting.length; i++) {
+    for (let n = 1; n <= 6 && i + n <= posting.length; n++) {
+      for (const key of withoutVersion(skillKey(posting.slice(i, i + n).join(' ')))) if (key) keys.add(key);
+    }
+  }
+  const has = (key: string) => withoutVersion(key).some((k) => keys.has(k));
+  const named = (name: string) => withoutVersion(skillKey(name)).some((key) => (ALIAS_GROUPS.get(key) ?? [key]).some(has));
+  const everyWord = (name: string) => {
+    const parts = words(name).map(skillKey).filter(Boolean);
+    return parts.length > 1 && parts.every(has);
+  };
+  return (skill) => [skill, ...skill.split(/\s*(?:\/|\||\bor\b)\s*/i)].some((name) => named(name) || everyWord(name));
+}
 
 // Returns a function that names the profile skill covering a job skill, or null. Only exact names,
 // spelling variants and configured aliases count; nothing the model claims is taken on trust.

@@ -1,6 +1,8 @@
 {
   "resumePath": "./resume/YOUR_RESUME.pdf",
   "resumeName": "YOUR_RESUME.pdf",
+  "email": "YOUR_EMAIL",
+  "phone": "YOUR_PHONE",
   "currentTitle": "YOUR_CURRENT_TITLE",
   "currentLocation": "YOUR_CITY",
   "noticePeriodDays": 30,

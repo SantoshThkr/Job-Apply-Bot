@@ -2,27 +2,27 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { parseArgs } from 'node:util';
+import type { Page } from 'playwright';
+import { createApi } from './api.ts';
 import { firstPage, launchBrowser } from './browser/browser.ts';
-import { BLOCKED_MESSAGE, checkSession, waitForManualLogin, type SessionState } from './browser/session.ts';
-import { ROOT, loadEnv, loadProfile, loadSearches, type Env, type Profile } from './config.ts';
+import { BLOCKED_MESSAGE, SESSION_MESSAGES, checkSession, disableManualPauses, waitForManualLogin } from './browser/session.ts';
+import { ConfigError, ROOT, loadEnv, loadJobProfiles, loadProfile, type Env, type JobProfile, type Profile } from './config.ts';
 import { createProvider } from './ai/providers.ts';
 import { matchCounts, rankedJobs } from './db/analysis.ts';
+import { applicationSummary, listApplications } from './db/applications.ts';
 import { openDatabase } from './db/database.ts';
-import { JOB_STATUSES, countAwaitingDetails, jobCounts, type JobStatus } from './db/jobs.ts';
-import { describeQuery, discoverJobs, fetchMissingDetails, planQueries } from './jobs/discovery.ts';
-import { analyzeJobs, applyHardFilters } from './jobs/matching.ts';
-import type { MatchBand } from './jobs/scoring.ts';
+import { countAwaitingDetails, jobCounts } from './db/jobs.ts';
+import { closeAbandonedRuns, getRun, listRuns } from './db/runs.ts';
+import { BotControl } from './control.ts';
+import { FRESHNESS, JOB_STATUSES, type Freshness, type JobScope, type JobStatus, type MatchBand, type Run } from './domain.ts';
+import { planQueries } from './jobs/discovery.ts';
+import { applyHardFilters } from './jobs/matching.ts';
+import { applySettingsFrom, runAnalysis, runApplications, runSearch } from './jobs/runs.ts';
 import { log } from './logger.ts';
+import { formatRunReport } from './report.ts';
 
 const envFile = join(ROOT, '.env');
 if (existsSync(envFile)) process.loadEnvFile(envFile);
-
-const SESSION_MESSAGES: Record<SessionState, string> = {
-  LOGGED_IN: 'Naukri session detected',
-  LOGGED_OUT: 'Not logged in to Naukri. Run `npm run login`.',
-  CHALLENGE: 'PAUSED: Naukri is showing a CAPTCHA/OTP check. Run `npm run login` and complete it manually.',
-  BLOCKED: BLOCKED_MESSAGE,
-};
 
 async function login(): Promise<void> {
   const env = loadEnv();
@@ -70,48 +70,78 @@ async function session(): Promise<void> {
   }
 }
 
-// Search Naukri, drop obvious mismatches from the listing data, then read the remaining descriptions.
-async function runSearch(db: DatabaseSync, env: Env, profile: Profile, args: string[]): Promise<void> {
-  const { values } = parseArgs({ args, options: { keyword: { type: 'string' }, location: { type: 'string' } } });
-  const queries = planQueries(values.keyword ? [] : loadSearches(), profile, values);
-  log.info(`${queries.length} search(es) planned, up to ${env.MAX_JOBS_PER_RUN} new jobs`);
-  for (const query of queries) log.debug(`  ${describeQuery(query)}`);
+// Ctrl+C stops the run at a safe point: the job in hand is finished and recorded first. A second
+// Ctrl+C quits at once (Playwright still closes Chrome on exit).
+async function stoppable<T>(use: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const stop = () => {
+    log.info('Ctrl+C: stopping at a safe point. Press Ctrl+C again to quit at once.');
+    process.once('SIGINT', () => process.exit(130));
+    controller.abort('Stopped with Ctrl+C');
+  };
+  process.once('SIGINT', stop);
+  try {
+    return await use(controller.signal);
+  } finally {
+    process.off('SIGINT', stop);
+  }
+}
 
-  const context = await launchBrowser({ headless: env.HEADLESS, channel: env.BROWSER_CHANNEL });
+async function withBrowser<T>(env: Env, use: (page: Page, signal: AbortSignal) => Promise<T>): Promise<T> {
+  // Chrome stays open on Ctrl+C until the run has stopped; closing it here saves the session.
+  const context = await launchBrowser({ headless: env.HEADLESS, channel: env.BROWSER_CHANNEL, handleSignals: false });
   try {
     const page = await firstPage(context);
-    const state = await checkSession(page);
-    if (state !== 'LOGGED_IN') throw new Error(SESSION_MESSAGES[state]);
-    log.info(SESSION_MESSAGES[state]);
-
-    const { seen, added } = await discoverJobs(page, db, queries, env);
-    log.info(`Found ${seen} jobs, ${added} new`);
-    const { rejected } = applyHardFilters(db, profile);
-    if (rejected) log.info(`Filtered out ${rejected} job(s) on experience, location or title before reading descriptions`);
-    const { fetched, failed } = await fetchMissingDetails(page, db, env);
-    if (fetched || failed) log.info(`Descriptions read: ${fetched}${failed ? `, failed: ${failed}` : ''}`);
+    return await stoppable((signal) => use(page, signal));
   } finally {
     await context.close();
     log.info('Browser closed');
   }
 }
 
-async function runAnalysis(db: DatabaseSync, env: Env, profile: Profile, force: boolean): Promise<void> {
-  const { rejected } = applyHardFilters(db, profile, { recheck: force });
-  if (rejected) log.info(`Filtered out ${rejected} job(s) on experience, location or title`);
+// A run that stopped or failed has already said why; the exit code tells scripts.
+function exitWith(run: Run): Run {
+  if (run.status !== 'COMPLETED') process.exitCode = 1;
+  return run;
+}
 
+// --profile frontend,react (ids from config/job-profiles.json) and --fresh today|24h|3d|7d|all.
+const SCOPE_OPTIONS = { profile: { type: 'string' }, fresh: { type: 'string' } } as const;
+
+function scopeFrom(values: { profile?: string; fresh?: string }, jobProfiles: JobProfile[]): JobScope {
+  const profiles = values.profile?.split(',').map((id) => id.trim()).filter(Boolean) ?? [];
+  const unknown = profiles.filter((id) => !jobProfiles.some((p) => p.id === id));
+  if (unknown.length) throw new ConfigError(`Unknown --profile ${unknown.join(', ')}. Profiles: ${jobProfiles.map((p) => p.id).join(', ')}`);
+  const freshness = (values.fresh ?? 'all') as Freshness;
+  if (!FRESHNESS.includes(freshness)) throw new ConfigError(`--fresh must be one of ${FRESHNESS.join(', ')}`);
+  return { profiles, freshness };
+}
+
+async function runSearchCommand(db: DatabaseSync, env: Env, profile: Profile, args: string[]): Promise<Run> {
+  const { values } = parseArgs({ args, options: { keyword: { type: 'string' }, location: { type: 'string' }, ...SCOPE_OPTIONS } });
+  const jobProfiles = loadJobProfiles();
+  const scope = scopeFrom(values, jobProfiles);
+  const chosen = scope.profiles.length ? jobProfiles.filter((p) => scope.profiles.includes(p.id)) : jobProfiles;
+  const queries = planQueries(chosen, profile, {
+    keywords: values.keyword ? [values.keyword] : [],
+    locations: values.location ? [values.location] : [],
+    freshness: scope.freshness,
+  });
+  return withBrowser(env, async (page, signal) => exitWith(await runSearch(page, db, env, profile, jobProfiles, queries, { scope, signal }).done));
+}
+
+async function runAnalysisCommand(db: DatabaseSync, env: Env, profile: Profile, force: boolean): Promise<void> {
   const provider = createProvider(env);
-  const settings: [string, string | number][] = [
+  printTable([
     ['AI provider', provider.label],
     ['Model', provider.model],
     ['Endpoint', provider.endpoint],
     ['Concurrency', env.AI_CONCURRENCY],
-  ];
-  printTable(settings);
+  ]);
 
-  const summary = await analyzeJobs(db, profile, env, { provider, force });
-  if (summary.attempted) {
-    const status = !summary.modelChecked
+  const { stats } = exitWith(await stoppable((signal) => runAnalysis(db, env, profile, loadJobProfiles(), { provider, force, signal }).done));
+  if (stats.attempted) {
+    const status = !stats.modelChecked
       ? 'not needed (all results cached)'
       : provider.name === 'ollama'
         ? 'running, model installed'
@@ -120,15 +150,15 @@ async function runAnalysis(db: DatabaseSync, env: Env, profile: Profile, force: 
       ['AI provider', provider.label],
       ['Model', provider.model],
       [`${provider.label} status`, status],
-      ['Jobs analyzed', summary.attempted],
-      ['Successful analyses', summary.succeeded],
-      ['Failed analyses', summary.failed],
-      ['Cache hits', summary.cacheHits],
-      ['Cache misses', summary.cacheMisses],
-      ['Average analysis time', summary.averageMs === null ? 'n/a' : `${(summary.averageMs / 1_000).toFixed(1)}s`],
+      ['Jobs analyzed', stats.attempted],
+      ['Successful analyses', stats.succeeded ?? 0],
+      ['Failed analyses', stats.failed ?? 0],
+      ['Cache hits', stats.cacheHits ?? 0],
+      ['Cache misses', stats.cacheMisses ?? 0],
+      ['Average analysis time', stats.averageMs === undefined ? 'n/a' : `${(stats.averageMs / 1_000).toFixed(1)}s`],
     ]);
-    if (summary.failed) log.info('Failed jobs are marked ANALYSIS_FAILED; `npm run analyze -- --force` retries them.');
-  } else {
+    if (stats.failed) log.info('Failed jobs are marked ANALYSIS_FAILED; `npm run analyze -- --force` retries them.');
+  } else if (stats.attempted === 0) {
     log.info('No jobs waiting for analysis');
   }
   const waiting = countAwaitingDetails(db);
@@ -166,12 +196,19 @@ function printMatches(db: DatabaseSync, env: Env): void {
   }
 }
 
+// Every command that writes to the database first closes runs a crashed process left open.
+function openDb(): DatabaseSync {
+  const db = openDatabase();
+  closeAbandonedRuns(db);
+  return db;
+}
+
 async function search(): Promise<void> {
   const env = loadEnv();
   const profile = loadProfile();
-  const db = openDatabase();
+  const db = openDb();
   try {
-    await runSearch(db, env, profile, process.argv.slice(3));
+    await runSearchCommand(db, env, profile, process.argv.slice(3));
   } finally {
     db.close();
   }
@@ -181,9 +218,9 @@ async function analyze(): Promise<void> {
   const { values } = parseArgs({ args: process.argv.slice(3), options: { force: { type: 'boolean', default: false } } });
   const env = loadEnv();
   const profile = loadProfile();
-  const db = openDatabase();
+  const db = openDb();
   try {
-    await runAnalysis(db, env, profile, values.force);
+    await runAnalysisCommand(db, env, profile, values.force);
     printMatches(db, env);
   } finally {
     db.close();
@@ -194,11 +231,67 @@ async function analyze(): Promise<void> {
 async function dryRun(): Promise<void> {
   const env = loadEnv();
   const profile = loadProfile();
+  const db = openDb();
+  try {
+    const search = await runSearchCommand(db, env, profile, process.argv.slice(3));
+    if (search.status === 'STOPPED') return;
+    await runAnalysisCommand(db, env, profile, false);
+    printMatches(db, env);
+  } finally {
+    db.close();
+  }
+}
+
+function intOption(value: string | undefined, name: string, min: number, max: number): number | undefined {
+  if (value === undefined) return undefined;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < min || n > max) throw new ConfigError(`--${name} must be a whole number from ${min} to ${max}`);
+  return n;
+}
+
+function printReport(db: DatabaseSync, run: Run): void {
+  console.log(`\n${formatRunReport(run, listApplications(db, { runId: run.id }))}\n`);
+}
+
+// Works through every shortlisted job, freshest first. Without --auto-apply (or AUTO_APPLY=true) it
+// only checks each job and stops before Apply, because on Naukri that click sends the application.
+async function apply(): Promise<void> {
+  const { values } = parseArgs({
+    args: process.argv.slice(3),
+    options: { max: { type: 'string' }, 'min-score': { type: 'string' }, 'auto-apply': { type: 'boolean', default: false }, ...SCOPE_OPTIONS },
+  });
+  const env = loadEnv();
+  const settings = applySettingsFrom(env, scopeFrom(values, loadJobProfiles()));
+  settings.limit = intOption(values.max, 'max', 1, 1_000_000) ?? null;
+  settings.minMatchScore = intOption(values['min-score'], 'min-score', 0, 100) ?? settings.minMatchScore;
+  if (values['auto-apply']) settings.autoApply = true;
+  printTable([
+    ['Profiles', settings.profiles.join(', ') || 'all'],
+    ['Posted', settings.freshness],
+    ['Minimum match score', settings.minMatchScore],
+    ['Jobs', settings.limit ? `first ${settings.limit} in the queue` : 'every eligible job'],
+    ['Auto fill', settings.autoFill ? 'ON' : 'OFF'],
+    ['Auto apply', settings.autoApply ? 'ON (applications will be sent)' : 'OFF (stops before Apply)'],
+    ['Delay after applying', `${settings.delaySeconds}s`],
+  ]);
+
+  const db = openDb();
+  try {
+    const browseDelayMs: [number, number] = [env.DELAY_MIN_MS, env.DELAY_MAX_MS];
+    await withBrowser(env, async (page, signal) => printReport(db, exitWith(await runApplications(page, db, settings, { browseDelayMs, signal }).done)));
+  } finally {
+    db.close();
+  }
+}
+
+// The report for one run: `npm run report -- RUN-20260925-233612`, or the latest application run.
+async function report(): Promise<void> {
+  const id = process.argv[3];
   const db = openDatabase();
   try {
-    await runSearch(db, env, profile, process.argv.slice(3));
-    await runAnalysis(db, env, profile, false);
-    printMatches(db, env);
+    const run = id ? getRun(db, id) : listRuns(db, { kind: 'APPLY', limit: 1 })[0];
+    if (!run) throw new Error(id ? `No run ${id}` : 'No application runs yet');
+    printReport(db, run);
   } finally {
     db.close();
   }
@@ -211,6 +304,11 @@ async function status(): Promise<void> {
     startOfToday.setHours(0, 0, 0, 0);
     const jobs = jobCounts(db, startOfToday);
     const matches = matchCounts(db);
+    const { counts: applications } = applicationSummary(db, {
+      scope: { profiles: [], freshness: 'all' },
+      minMatchScore: loadEnv().MIN_MATCH_SCORE,
+      isAnswered: () => false,
+    });
     const rows: [string, number][] = [
       ['Jobs stored', jobs.total],
       ['Discovered today', jobs.discoveredSince],
@@ -223,6 +321,12 @@ async function status(): Promise<void> {
       ['Filtered out early', matches.skippedByFilter],
       ['Analysis failed', matches.analysisFailed],
       ['Waiting for analysis', jobs.byStatus.DISCOVERED ?? 0],
+      ['Ready to apply', applications.ready],
+      ['Applied (confirmed)', applications.applied],
+      ['Already applied', applications.already_applied],
+      ['Application failed', applications.failed],
+      ['External', applications.external],
+      ['Needs review', applications.review],
     ];
     for (const [label, value] of rows) console.log(`${`${label}:`.padEnd(24)}${String(value).padStart(5)}`);
     for (const status of JOB_STATUSES.slice(JOB_STATUSES.indexOf('APPLICATION_STARTED'))) {
@@ -234,7 +338,42 @@ async function status(): Promise<void> {
   }
 }
 
-const commands: Record<string, () => Promise<void>> = { login, session, search, analyze, 'dry-run': dryRun, status };
+// The local API the dashboard talks to. It owns the browser while it runs; the other commands can't
+// open the same Chrome profile meanwhile.
+async function server(): Promise<void> {
+  const env = loadEnv();
+  const db = openDb();
+  disableManualPauses();
+  const control = new BotControl({ db, env });
+  // Sorts jobs into the current job profiles before the dashboard lists them.
+  try {
+    applyHardFilters(db, loadProfile(), loadJobProfiles());
+  } catch (err) {
+    if (!(err instanceof ConfigError)) throw err;
+    log.warn(err.message);
+  }
+
+  const api = createApi({ control, db, env });
+  await new Promise<void>((resolve, reject) => {
+    api.once('error', (err: NodeJS.ErrnoException) =>
+      reject(err.code === 'EADDRINUSE' ? new ConfigError(`Port ${env.API_PORT} is in use. Stop the other server or set API_PORT in .env.`) : err),
+    );
+    api.listen(env.API_PORT, '127.0.0.1', resolve);
+  });
+  log.info(`Dashboard API on http://127.0.0.1:${env.API_PORT}. Start the dashboard with \`npm run web\` and open http://127.0.0.1:3000`);
+
+  const signal = await new Promise<string>((resolve) => {
+    for (const name of ['SIGINT', 'SIGTERM'] as const) process.once(name, () => resolve(name));
+  });
+  log.info(`${signal}: stopping any run at a safe point, then closing Chrome. Press Ctrl+C again to quit at once.`);
+  process.once('SIGINT', () => process.exit(130));
+  await control.shutdown();
+  api.closeAllConnections();
+  api.close();
+  db.close();
+}
+
+const commands: Record<string, () => Promise<void>> = { login, session, search, analyze, 'dry-run': dryRun, apply, report, status, server };
 
 const name = process.argv[2] ?? '';
 const command = commands[name];

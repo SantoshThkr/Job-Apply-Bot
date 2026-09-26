@@ -4,8 +4,16 @@
     "answer": "YOUR_ANSWER"
   },
   {
+    "match": ["notice period"],
+    "answer": "YOUR_NOTICE_PERIOD"
+  },
+  {
     "match": ["current ctc"],
     "answer": "YOUR_CURRENT_CTC"
+  },
+  {
+    "match": ["expected ctc"],
+    "answer": "YOUR_EXPECTED_CTC"
   },
   {
     "match": ["work from office"],

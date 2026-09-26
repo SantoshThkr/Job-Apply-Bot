@@ -73,14 +73,18 @@ export function parseSalaryLakhs(label: string | null): { min: number; max: numb
   return { min, max };
 }
 
-// Epoch ms from the search API, ISO dates from schema.org, or relative labels from job cards.
-// Relative labels are approximate: "30+ Days Ago" becomes 30 days ago.
+// Epoch ms from the search API (kept to the second, which "last 24 hours" needs), ISO dates from
+// schema.org, or relative labels from job cards. Day labels are approximate: "30+ Days Ago" becomes
+// the date 30 days ago.
 export function parsePostedDate(value: string | number | null | undefined, now = new Date()): string | null {
-  if (typeof value === 'number') return value > 0 ? localDate(new Date(value)) : null;
+  if (typeof value === 'number') return value > 0 ? new Date(value).toISOString() : null;
   if (!value) return null;
   if (/^\d{4}-\d{2}-\d{2}/.test(value)) return value.slice(0, 10);
   const text = value.toLowerCase();
-  if (/just now|today|hours? ago|minutes? ago|few hours/.test(text)) return localDate(now);
+  const hours = text.match(/(\d+)\+?\s*hours? ago/);
+  if (hours) return new Date(now.getTime() - Number(hours[1]) * 3_600_000).toISOString();
+  if (/just now|minutes? ago|few hours/.test(text)) return now.toISOString();
+  if (/today/.test(text)) return localDate(now);
   const match = text.match(/(\d+)\+?\s*(day|week|month)/);
   if (!match) return null;
   const days = Number(match[1]) * { day: 1, week: 7, month: 30 }[match[2] as 'day' | 'week' | 'month'];

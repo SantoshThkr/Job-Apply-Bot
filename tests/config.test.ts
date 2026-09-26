@@ -6,14 +6,14 @@ import {
   ConfigError,
   ROOT,
   answersSchema,
+  jobProfilesSchema,
   loadEnv,
+  loadJobProfiles,
   loadProfile,
   loadResume,
-  loadSearches,
   paths,
   profileSchema,
   resumeSchema,
-  searchesSchema,
 } from '../src/config.ts';
 
 // Tests use only the public templates; config/*.json holds personal data and is not in the repo.
@@ -31,18 +31,24 @@ function configDir(files: Record<string, unknown>): string {
 describe('loadEnv', () => {
   it('defaults to the safe settings', () => {
     const env = loadEnv({});
-    expect(env.STOP_BEFORE_SUBMIT).toBe(true);
+    expect(env.AUTO_APPLY).toBe(false);
+    expect(env.DEBUG_SCREENSHOTS).toBe(false);
     expect(env.HEADLESS).toBe(false);
     expect(env.BROWSER_CHANNEL).toBe('chrome');
-    expect(env.MAX_JOBS_PER_RUN).toBe(50);
     expect(env.MIN_MATCH_SCORE).toBe(75);
+  });
+
+  it('puts no cap on how many jobs a run handles unless you set one', () => {
+    expect(loadEnv({}).MAX_JOBS_PER_RUN).toBeUndefined();
+    expect(loadEnv({ MAX_JOBS_PER_RUN: '5000' }).MAX_JOBS_PER_RUN).toBe(5000);
+    expect(loadEnv({}).SEARCH_MAX_PAGES).toBe(10);
   });
 
   it('defaults to free local analysis with Ollama and needs no API key', () => {
     expect(loadEnv({})).toMatchObject({
       AI_PROVIDER: 'ollama',
       OLLAMA_BASE_URL: 'http://localhost:11434',
-      OLLAMA_MODEL: 'qwen3:8b',
+      OLLAMA_MODEL: 'qwen3:4b',
       AI_CONCURRENCY: 1,
       AI_MAX_ATTEMPTS: 3,
     });
@@ -57,8 +63,8 @@ describe('loadEnv', () => {
   });
 
   it('parses booleans and numbers from strings', () => {
-    const env = loadEnv({ STOP_BEFORE_SUBMIT: 'false', HEADLESS: 'true', MAX_JOBS_PER_RUN: '20' });
-    expect(env).toMatchObject({ STOP_BEFORE_SUBMIT: false, HEADLESS: true, MAX_JOBS_PER_RUN: 20 });
+    const env = loadEnv({ AUTO_APPLY: 'true', HEADLESS: 'true', MAX_JOBS_PER_RUN: '20' });
+    expect(env).toMatchObject({ AUTO_APPLY: true, HEADLESS: true, MAX_JOBS_PER_RUN: 20 });
   });
 
   it('treats blank values as unset', () => {
@@ -68,7 +74,7 @@ describe('loadEnv', () => {
   });
 
   it('rejects values it cannot interpret instead of guessing', () => {
-    expect(() => loadEnv({ STOP_BEFORE_SUBMIT: 'maybe' })).toThrow(ConfigError);
+    expect(() => loadEnv({ AUTO_APPLY: 'maybe' })).toThrow(ConfigError);
     expect(() => loadEnv({ MAX_JOBS_PER_RUN: 'lots' })).toThrow(/MAX_JOBS_PER_RUN/);
     expect(() => loadEnv({ MIN_MATCH_SCORE: '120' })).toThrow(/MIN_MATCH_SCORE/);
     expect(() => loadEnv({ DELAY_MIN_MS: '5000', DELAY_MAX_MS: '1000' })).toThrow(/DELAY_MIN_MS/);
@@ -79,14 +85,22 @@ describe('config files', () => {
   it('ships example templates that match the schemas', () => {
     expect(profileSchema.safeParse(example('profile.example.json')).success).toBe(true);
     expect(resumeSchema.safeParse(example('resume.example.json')).success).toBe(true);
-    expect(searchesSchema.safeParse(example('searches.example.json')).success).toBe(true);
+    expect(jobProfilesSchema.safeParse(example('job-profiles.example.json')).success).toBe(true);
     expect(answersSchema.safeParse(example('answers.example.json')).success).toBe(true);
   });
 
   it('loads a filled-in config and resolves the resume path', () => {
     const dir = configDir({
       'profile.json': validProfile,
-      'resume.json': { ...example('resume.example.json'), resumePath: './resume/cv.pdf', resumeName: 'cv.pdf', currentTitle: 'Engineer', currentLocation: 'Pune' },
+      'resume.json': {
+        ...example('resume.example.json'),
+        resumePath: './resume/cv.pdf',
+        resumeName: 'cv.pdf',
+        email: 'candidate@example.com',
+        phone: '0000000000',
+        currentTitle: 'Engineer',
+        currentLocation: 'Pune',
+      },
     });
     expect(loadProfile(dir).name).toBe('Test Candidate');
     expect(loadResume(dir).resumePath).toBe(join(ROOT, 'resume', 'cv.pdf'));
@@ -94,21 +108,21 @@ describe('config files', () => {
 
   it('refuses a config that still has template values', () => {
     const dir = configDir({ 'resume.json': example('resume.example.json') });
-    expect(() => loadResume(dir)).toThrow(/template values at: resumePath, resumeName, currentTitle, currentLocation/);
+    expect(() => loadResume(dir)).toThrow(/template values at: resumePath, resumeName, email, phone, currentTitle, currentLocation/);
   });
 
   it('explains how to create a missing config', () => {
     expect(() => loadProfile(configDir({}))).toThrow(/Copy config\/profile\.example\.json to config\/profile\.json/);
   });
 
-  it('rejects an inverted experience range', () => {
-    const dir = configDir({ 'profile.json': { ...validProfile, minimumExperience: 12, maximumExperience: 6 } });
-    expect(() => loadProfile(dir)).toThrow(/minimumExperience must not exceed/);
+  it('still loads an older profile.json with experience limits and target roles, which no longer filter anything', () => {
+    const older = { ...validProfile, targetRoles: ['AI Engineer'], minimumExperience: 12, maximumExperience: 6 };
+    expect(loadProfile(configDir({ 'profile.json': older })).name).toBe('Test Candidate');
   });
 
   it('rejects misspelled keys', () => {
-    const { minimumExperience, ...rest } = validProfile;
-    const dir = configDir({ 'profile.json': { ...rest, minimumExperiance: minimumExperience } });
+    const { experienceYears, ...rest } = validProfile;
+    const dir = configDir({ 'profile.json': { ...rest, experienceYear: experienceYears } });
     expect(() => loadProfile(dir)).toThrow(ConfigError);
   });
 
@@ -119,14 +133,30 @@ describe('config files', () => {
     expect(() => loadProfile(bad)).toThrow(/skillAliases key must be one of your/);
   });
 
-  it('rejects duplicate search names', () => {
-    const search = { name: 'React', keywords: ['React Developer'] };
-    const dir = configDir({ 'searches.json': [search, { ...search, name: 'react' }] });
-    expect(() => loadSearches(dir)).toThrow(/unique/);
+  it('ships the seven job profiles, and prefers your own job-profiles.json', () => {
+    const shipped = example('job-profiles.example.json');
+    expect(loadJobProfiles(configDir({ 'job-profiles.example.json': shipped })).map((p) => p.name)).toEqual([
+      'Frontend Developer',
+      'React.js Developer',
+      'Angular Developer',
+      'Web Developer',
+      'Full Stack Developer',
+      'Full Stack AI Engineer',
+      'All / Broad Software & Web',
+    ]);
+    const own = [{ id: 'vue', name: 'Vue Developer', keywords: ['Vue Developer'] }];
+    const dir = configDir({ 'job-profiles.example.json': shipped, 'job-profiles.json': own });
+    expect(loadJobProfiles(dir)).toEqual([{ ...own[0], skills: [], exclude: [], ai: false }]);
+  });
+
+  it('rejects duplicate job profile ids', () => {
+    const profile = { id: 'react', name: 'React', keywords: ['React Developer'] };
+    const dir = configDir({ 'job-profiles.json': [profile, { ...profile, name: 'React again' }] });
+    expect(() => loadJobProfiles(dir)).toThrow(/unique/);
   });
 
   it('names the file when JSON is malformed', () => {
-    const dir = configDir({ 'searches.json': '[{' });
-    expect(() => loadSearches(dir)).toThrow(/config\/searches\.json/);
+    const dir = configDir({ 'job-profiles.json': '[{' });
+    expect(() => loadJobProfiles(dir)).toThrow(/config\/job-profiles\.json/);
   });
 });

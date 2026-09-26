@@ -8,6 +8,7 @@ import { evidence, testProfile } from './fixtures.ts';
 // Ollama is mocked; these tests need neither a running server nor the internet.
 
 const job: JobForAnalysis = {
+  targetRoles: ['AI Engineer'],
   title: 'AI Engineer',
   company: 'Acme',
   location: 'Bengaluru',
@@ -115,9 +116,9 @@ describe('analyze', () => {
 
 describe('provider selection', () => {
   it('uses local Ollama by default and never contacts OpenAI', async () => {
-    const fetchImpl = mockFetch(tags('qwen3:8b'), chat(valid));
+    const fetchImpl = mockFetch(tags('qwen3:4b'), chat(valid));
     const local = createProvider(loadEnv({}), fetchImpl);
-    expect(local).toMatchObject({ name: 'ollama', model: 'qwen3:8b', endpoint: 'http://localhost:11434' });
+    expect(local).toMatchObject({ name: 'ollama', model: 'qwen3:4b', endpoint: 'http://localhost:11434' });
 
     await local.ensureReady();
     await local.analyze(job, testProfile);
@@ -126,8 +127,8 @@ describe('provider selection', () => {
   });
 
   it('honours OLLAMA_BASE_URL and OLLAMA_MODEL, and selects OpenAI only when asked', () => {
-    const custom = createProvider(loadEnv({ OLLAMA_BASE_URL: 'http://127.0.0.1:9999', OLLAMA_MODEL: 'qwen3:4b' }));
-    expect(custom).toMatchObject({ name: 'ollama', model: 'qwen3:4b', endpoint: 'http://127.0.0.1:9999' });
+    const custom = createProvider(loadEnv({ OLLAMA_BASE_URL: 'http://127.0.0.1:9999', OLLAMA_MODEL: 'llama3.2:3b' }));
+    expect(custom).toMatchObject({ name: 'ollama', model: 'llama3.2:3b', endpoint: 'http://127.0.0.1:9999' });
     expect(createProvider(loadEnv({ AI_PROVIDER: 'openai', OPENAI_API_KEY: 'test-key' }))).toMatchObject({ name: 'openai' });
   });
 });
