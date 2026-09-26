@@ -9,6 +9,7 @@ const LINKS = [
   ['/jobs', 'Jobs'],
   ['/apply', 'Apply'],
   ['/history', 'History'],
+  ['/profile', 'Profile'],
 ] as const;
 
 export function Header() {

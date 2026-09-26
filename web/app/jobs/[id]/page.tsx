@@ -9,6 +9,7 @@ import { ErrorText, Panel, StatusBadge } from '@/components/ui';
 import { useApi } from '@/lib/api';
 import { dateTime, posted } from '@/lib/format';
 import { useLive } from '@/lib/live';
+import { scopeQuery, useSettings } from '@/lib/scope';
 
 function Skills({ title, skills }: { title: string; skills: string[] }) {
   return (
@@ -22,7 +23,8 @@ function Skills({ title, skills }: { title: string; skills: string[] }) {
 export default function JobPage() {
   const { id } = useParams<{ id: string }>();
   const { version } = useLive();
-  const { data: job, error } = useApi<JobDetail>(`/api/jobs/${id}`, version);
+  const { settings } = useSettings();
+  const { data: job, error } = useApi<JobDetail>(`/api/jobs/${id}?${scopeQuery(settings)}`, version);
   const { data: profiles } = useApi<JobProfileSummary[]>('/api/profiles');
   const [selected, setSelected] = useState<number | null>(null);
 
@@ -47,7 +49,10 @@ export default function JobPage() {
           <dt className="text-slate-500">Profiles</dt>
           <dd>{profileNames.join(', ') || '-'}</dd>
           <dt className="text-slate-500">Experience asked</dt>
-          <dd>{job.experience ?? '-'} <span className="text-xs text-slate-500">(shown only; never a filter)</span></dd>
+          <dd>
+            {job.experience ?? '-'}
+            {job.ineligibleReason && <span className="ml-2 text-xs text-slate-500">Not eligible: {job.ineligibleReason}</span>}
+          </dd>
           <dt className="text-slate-500">Applies on</dt>
           <dd>
             {job.externalApply ? (

@@ -41,7 +41,7 @@ export class OpenAiJobAnalysisProvider implements JobAnalysisProvider {
     if (!this.#apiKey) throw new AiError('OPENAI_API_KEY is not set. Add it to .env, or use AI_PROVIDER=ollama.', true);
   }
 
-  analyze(job: JobForAnalysis, profile: Profile): Promise<MatchEvidence> {
+  analyze(job: JobForAnalysis, profile: Profile, signal?: AbortSignal): Promise<MatchEvidence> {
     const body = {
       model: this.model,
       messages: [
@@ -54,7 +54,7 @@ export class OpenAiJobAnalysisProvider implements JobAnalysisProvider {
       },
     };
     return completeWithValidation(this.#attempts, job.title, async () => {
-      const completion = completionSchema.safeParse(await this.#post(body));
+      const completion = completionSchema.safeParse(await this.#post(body, signal));
       const choice = completion.success ? completion.data.choices[0] : undefined;
       if (!choice) throw new AiError('unexpected response shape', false);
       if (choice.message.refusal) throw new AiError(`the model refused: ${choice.message.refusal}`, false);
@@ -63,7 +63,7 @@ export class OpenAiJobAnalysisProvider implements JobAnalysisProvider {
     });
   }
 
-  async #post(body: object): Promise<unknown> {
+  async #post(body: object, signal?: AbortSignal): Promise<unknown> {
     if (!this.#apiKey) throw new AiError('OPENAI_API_KEY is not set.', true);
     for (let attempt = 1; ; attempt++) {
       const backoffMs = this.#retryDelayMs * 2 ** (attempt - 1);
@@ -73,9 +73,10 @@ export class OpenAiJobAnalysisProvider implements JobAnalysisProvider {
           method: 'POST',
           headers: { Authorization: `Bearer ${this.#apiKey}`, 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(120_000),
+          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(120_000)]) : AbortSignal.timeout(120_000),
         });
       } catch (err) {
+        if (signal?.aborted) throw new AiError('Stopped', true);
         if (attempt >= MAX_HTTP_ATTEMPTS) throw new AiError(`OpenAI request failed: ${(err as Error).message}`, false);
         await sleep(backoffMs);
         continue;

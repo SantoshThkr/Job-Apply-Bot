@@ -6,6 +6,7 @@ import { useParams } from 'next/navigation';
 import { useState } from 'react';
 import { ApplicationDetails, ApplicationTable } from '@/components/applications';
 import { RunControls } from '@/components/live';
+import { RunSummary } from '@/components/summary';
 import { ErrorText, Panel, StatusBadge } from '@/components/ui';
 import { useApi } from '@/lib/api';
 import { dateTime } from '@/lib/format';
@@ -27,15 +28,7 @@ export default function RunPage() {
         ← History
       </Link>
       <Panel title={`Run ${dateTime(run.startedAt)}`} actions={active ? <RunControls /> : <StatusBadge status={run.status} />}>
-        <p className="text-sm text-slate-700">
-          {run.attempted} jobs · {run.outcomes.applied} applied · {run.outcomes.failed} failed · {run.outcomes.review} review · {run.outcomes.external}{' '}
-          external · {run.outcomes.ready} ready to apply · {run.outcomes.already_applied} already applied
-        </p>
-        {run.stopReason && (
-          <p className="mt-2 text-sm text-amber-900">
-            {run.status === 'FAILED' ? 'Failed' : 'Stopped'}: {run.stopReason}
-          </p>
-        )}
+        <RunSummary run={run} />
         <p className="mt-1 font-mono text-xs text-slate-500">{run.id}</p>
       </Panel>
       <Panel title="Results">

@@ -30,6 +30,11 @@ export function setRunPaused(db: DatabaseSync, id: string, paused: boolean): voi
   db.prepare(`UPDATE runs SET status = ? WHERE id = ? AND status IN ('RUNNING', 'PAUSED')`).run(paused ? 'PAUSED' : 'RUNNING', id);
 }
 
+// Counts saved while the run goes on, so pages (and a crash) see them before it ends.
+export function saveRunStats(db: DatabaseSync, id: string, stats: Run['stats']): void {
+  db.prepare(`UPDATE runs SET stats = ? WHERE id = ?`).run(JSON.stringify(stats), id);
+}
+
 export function finishRun(
   db: DatabaseSync,
   id: string,

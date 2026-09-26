@@ -14,7 +14,8 @@ export interface Finding {
 // Files that must stay local whatever they contain.
 const PRIVATE_PATHS: [RegExp, string][] = [
   [/(^|\/)\.env(\.(?!example$)[^/]+)?$/, 'environment file'],
-  [/^data\//, 'local data (browser profile, database)'],
+  [/^data\/(?![^/]*\.example\.json$)/, 'local data (profile, resume, browser profile, database)'],
+  [/(^|\/)(user-profile|answers)\.json$/, 'personal profile or answers'],
   [/^config\/(?![^/]*\.example\.json$)[^/]*\.json$/, 'personal config'],
   [/^resume\/(?!README\.md$)/, 'resume folder'],
   [/\.(pdf|docx?)$/i, 'document (resume?)'],

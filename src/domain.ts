@@ -105,6 +105,8 @@ export type RunEventType =
   | 'RUN_STOPPED'
   | 'RUN_COMPLETED'
   | 'RUN_FAILED'
+  | 'SEARCH_FINISHED'
+  | 'QUEUE_READY'
   | 'JOB_STARTED'
   | 'JOB_OPENED'
   | 'APPLY_BUTTON_FOUND'
@@ -150,23 +152,55 @@ export function domainOf(url: string | null): string | null {
   }
 }
 
-export const FRESHNESS = ['today', '24h', '3d', '7d', 'all'] as const;
+export const FRESHNESS = ['today', '24h', '2d', '3d', '7d', 'custom', 'all'] as const;
 export type Freshness = (typeof FRESHNESS)[number];
 
 const HOUR_MS = 3_600_000;
 
-// The oldest posting time that still counts as fresh, or null for no limit. "Today" starts at local midnight.
-export function freshSince(freshness: Freshness, now = new Date()): string | null {
-  if (freshness === 'all') return null;
-  if (freshness === 'today') return new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
-  const hours = { '24h': 24, '3d': 72, '7d': 168 }[freshness];
-  return new Date(now.getTime() - hours * HOUR_MS).toISOString();
+// "2026-09-20" as that day's local midnight, plus `days`.
+function localDay(day: string, days = 0): Date {
+  const [y, m, d] = day.split('-').map(Number);
+  return new Date(y!, m! - 1, d! + days);
 }
 
-// Which jobs a search, a list or an application run covers. No profiles means all of them.
+// Which jobs a search, a list or an application run covers.
 export interface JobScope {
+  // Job profile ids; none means all of them.
   profiles: string[];
   freshness: Freshness;
+  // A custom range, as local dates (YYYY-MM-DD), both days included.
+  from?: string | null;
+  to?: string | null;
+  // Cities to search and list; none means anywhere. Remote jobs always count.
+  locations?: string[];
+  // Jobs asking for more than experienceYears plus the tolerance are not eligible. null: not checked.
+  experienceYears?: number | null;
+  toleranceMonths?: number;
+}
+
+// The posting times a scope covers, [since, until); null leaves that end open. "Today" starts at
+// local midnight.
+export function freshWindow(scope: Pick<JobScope, 'freshness' | 'from' | 'to'>, now = new Date()): { since: string | null; until: string | null } {
+  switch (scope.freshness) {
+    case 'all':
+      return { since: null, until: null };
+    case 'today':
+      return { since: new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString(), until: null };
+    case 'custom':
+      return {
+        since: scope.from ? localDay(scope.from).toISOString() : null,
+        until: scope.to ? localDay(scope.to, 1).toISOString() : null,
+      };
+    default: {
+      const hours = { '24h': 24, '2d': 48, '3d': 72, '7d': 168 }[scope.freshness];
+      return { since: new Date(now.getTime() - hours * HOUR_MS).toISOString(), until: null };
+    }
+  }
+}
+
+// The most experience a job may ask for and still be applied to, or null when it isn't checked.
+export function maxExperience(scope: Pick<JobScope, 'experienceYears' | 'toleranceMonths'>): number | null {
+  return scope.experienceYears == null ? null : scope.experienceYears + (scope.toleranceMonths ?? 0) / 12;
 }
 
 export interface JobProfileSummary {
@@ -211,13 +245,22 @@ export interface AnalysisProgressEvent {
   timestamp: string;
 }
 
+// After each page of search results, so lists refresh while the search goes on. Not stored.
+export interface SearchProgressEvent {
+  type: 'SEARCH_PROGRESS';
+  runId: string;
+  found: number;
+  added: number;
+  timestamp: string;
+}
+
 export interface StateEvent {
   type: 'STATE';
   state: BotState;
   timestamp: string;
 }
 
-export type BotEvent = RunEvent | LogEvent | AnalysisProgressEvent | StateEvent;
+export type BotEvent = RunEvent | LogEvent | AnalysisProgressEvent | SearchProgressEvent | StateEvent;
 
 export type SessionStatus = SessionState | 'UNKNOWN' | 'WAITING_FOR_LOGIN';
 export type BrowserStatus = 'RUNNING' | 'STOPPED';
@@ -253,12 +296,15 @@ export interface Run {
 export interface StatusResponse {
   state: BotState;
   ai: { provider: string; model: string };
-  counts: { jobsFound: number; freshJobs: number; applied: number; failed: number };
+  profileReady: boolean;
   lastRun: Run | null;
 }
 
-// Jobs the matcher hasn't cleared for applying yet, next to the application outcomes.
-export type JobCategory = Outcome | 'new' | 'low_match' | 'filtered';
+// A job's status as the dashboard shows it: where its latest attempt ended, or, for a job not
+// attempted yet, whether it can be applied to.
+export type JobCategory = Outcome | 'not_eligible';
+
+export const CATEGORY_LABELS: Record<JobCategory, string> = { ...OUTCOME_LABELS, not_eligible: 'Not eligible' };
 
 export interface JobListItem {
   id: number;
@@ -273,6 +319,8 @@ export interface JobListItem {
   jobStatus: JobStatus;
   applicationStatus: ApplicationStatus | null;
   category: JobCategory;
+  // Why a job is not eligible: "Requires 10+ years", or a low AI match.
+  ineligibleReason: string | null;
 }
 
 export interface JobPage {
@@ -356,23 +404,77 @@ export interface RunDetail extends Run {
 }
 
 export interface ApplySettings extends JobScope {
+  // Jobs the AI has scored below this are not applied to; jobs it hasn't scored are.
   minMatchScore: number;
   // Click Apply and answer known questions. On Naukri that click, or the last answer, sends the application.
   autoApply: boolean;
   autoFill: boolean;
   delaySeconds: number;
   debugScreenshots: boolean;
+  // Search Naukri before applying (the dashboard always does).
+  search: boolean;
   // Only from the command line, for trying one or two jobs; the dashboard runs through the whole queue.
   limit: number | null;
 }
 
-// The Apply page: where the jobs in scope stand, and how many a run would work through now.
-export interface ApplicationSummary {
-  counts: OutcomeCounts;
+// Where the jobs in a scope stand: the counts on the Dashboard and Apply pages.
+export interface ScopeSummary {
+  // Relevant to the chosen profiles, in the chosen locations, posted in the window.
+  found: number;
+  // Of those, the ones experience and the AI match allow applying to.
+  eligible: number;
+  counts: Record<JobCategory, number>;
+  // What a run would work through now.
   queued: number;
-  // Shortlisting needs an AI match first; these still wait for one.
-  awaitingMatch: number;
   minMatchScore: number;
-  autoApply: boolean;
   problems: string[];
+}
+
+// The run settings the dashboard offers as defaults.
+export interface RunDefaults {
+  autoApply: boolean;
+  locations: string[];
+  experienceYears: number | null;
+  toleranceMonths: number;
+}
+
+// The person applying. Stored only in data/user-profile.json on this machine.
+export interface UserProfile {
+  firstName: string;
+  lastName: string;
+  email: string;
+  phone: string;
+  // Current city.
+  location: string;
+  preferredLocations: string[];
+  experienceYears: number;
+  experienceToleranceMonths: number;
+  currentRole: string;
+  currentCompany: string;
+  noticePeriodDays: number | null;
+  currentSalary: string;
+  expectedSalary: string;
+  skills: string[];
+  otherSkills: string[];
+  // Extra names that count as one of your skills, e.g. { "Node.js": ["Express"] }.
+  skillAliases: Record<string, string[]>;
+  // A file in data/resume/.
+  resumeFile: string | null;
+}
+
+// A recruiter question answered when it contains every phrase in `match`.
+export interface SavedAnswer {
+  match: string[];
+  answer: string;
+}
+
+export interface ProfileResponse {
+  profile: UserProfile | null;
+  answers: SavedAnswer[];
+  resume: { name: string; size: number } | null;
+  // Where the profile was read from: the data folder, or older config/*.json files.
+  source: 'data' | 'legacy' | null;
+  ready: boolean;
+  problems: string[];
+  defaults: RunDefaults;
 }

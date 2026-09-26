@@ -44,16 +44,20 @@ export function fakeProvider(
   overrides: Partial<Pick<JobAnalysisProvider, 'name' | 'model'>> = {},
 ) {
   const calls: string[] = [];
-  const provider: JobAnalysisProvider & { calls: string[]; readyChecks: number } = {
+  const provider: JobAnalysisProvider & { calls: string[]; readyChecks: number; releases: number } = {
     name: 'ollama',
     label: 'Ollama',
     model: 'test-model',
     endpoint: 'http://localhost:11434',
     calls,
     readyChecks: 0,
+    releases: 0,
     ...overrides,
     async ensureReady() {
       provider.readyChecks++;
+    },
+    async release() {
+      provider.releases++;
     },
     async analyze(job) {
       calls.push(job.title);

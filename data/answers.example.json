@@ -1,0 +1,7 @@
+[
+  { "match": ["relocate"], "answer": "YOUR_ANSWER" },
+  { "match": ["authorized to work"], "answer": "YOUR_ANSWER" },
+  { "match": ["current ctc"], "answer": "YOUR_CURRENT_CTC" },
+  { "match": ["preferred location"], "answer": "YOUR_ANSWER" },
+  { "match": ["work from office"], "answer": "YOUR_ANSWER" }
+]

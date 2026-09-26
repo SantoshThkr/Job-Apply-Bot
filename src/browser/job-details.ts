@@ -44,6 +44,11 @@ export function detailsFromJsonLd(blocks: string[]): JobDetails | null {
 
 const jobApiSchema = z.object({ jobDetails: z.object({ applyRedirectUrl: z.string().optional() }) });
 
+// The description on a job page that is already open, without waiting for it; null when it isn't there.
+export async function postingDetails(page: Page): Promise<JobDetails | null> {
+  return detailsFromJsonLd(await page.locator(DETAIL_SELECTORS.jsonLd).allTextContents().catch(() => []));
+}
+
 // The description, plus the company's own application URL when Naukri sends applicants there.
 export async function readJobDetails(
   page: Page,

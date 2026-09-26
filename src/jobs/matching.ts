@@ -4,28 +4,38 @@ import type { MatchEvidence } from '../ai/schemas.ts';
 import type { Env, JobProfile, Profile } from '../config.ts';
 import type { AnalysisProgressEvent, JobScope } from '../domain.ts';
 import { cachedEvidence, saveAnalysis } from '../db/analysis.ts';
-import { allJobs, jobsToAnalyze, setJobProfiles, updateJobStatus, type JobRow } from '../db/jobs.ts';
+import {
+  allJobs,
+  jobStatus,
+  jobsToAnalyze,
+  markAnalysisFailed,
+  nextJobToMatch,
+  setJobClassification,
+  setMatchScore,
+  updateJobStatus,
+  type JobRow,
+} from '../db/jobs.ts';
 import { log } from '../logger.ts';
-import { hardFilterReason, matchingProfiles } from './filtering.ts';
+import { hardFilterReason, jobCities, matchingProfiles } from './filtering.ts';
 import { bandFor, scoreMatch } from './scoring.ts';
 
-// Sorts every job into the job profiles it belongs to, then filters the ones not analyzed yet. Jobs
-// filtered out earlier are checked again, so edited profiles or locations take effect at once.
-export function applyHardFilters(db: DatabaseSync, profile: Profile, jobProfiles: JobProfile[]): { rejected: number; kept: number } {
+// Sorts every job into the job profiles and cities it belongs to, and sets aside jobs relevant to no
+// profile. Jobs set aside earlier are checked again, so edited profiles take effect at once.
+export function applyHardFilters(db: DatabaseSync, jobProfiles: JobProfile[]): { rejected: number; kept: number } {
   let rejected = 0;
   let kept = 0;
   db.exec('BEGIN');
   try {
     for (const job of allJobs(db)) {
       const profiles = matchingProfiles(job, jobProfiles);
-      if (profiles.join() !== job.profiles.join()) setJobProfiles(db, job.id, profiles);
+      const cities = jobCities(job);
+      if (profiles.join() !== job.profiles.join() || cities.join() !== job.cities.join()) setJobClassification(db, job.id, { profiles, cities });
       if (job.status !== 'DISCOVERED' && !(job.status === 'SKIPPED' && job.filterReason)) continue;
 
-      const reason = hardFilterReason(job, profile, profiles);
+      const reason = hardFilterReason(profiles);
       if (reason) {
         if (job.status === 'DISCOVERED') rejected++;
         if (reason !== job.filterReason) updateJobStatus(db, job.id, 'SKIPPED', { matchScore: null, filterReason: reason });
-        log.debug(`Filtered out: ${job.title} at ${job.company}. ${reason}`);
       } else {
         kept++;
         if (job.status === 'SKIPPED') updateJobStatus(db, job.id, 'DISCOVERED', { matchScore: null, filterReason: null });
@@ -53,6 +63,13 @@ export interface AnalysisSummary {
 
 export type AnalysisProgress = Pick<AnalysisProgressEvent, 'done' | 'total' | 'jobTitle' | 'company' | 'score' | 'band' | 'error'>;
 
+function analysisInput(job: JobRow, profile: Profile, provider: JobAnalysisProvider, jobProfiles: JobProfile[]) {
+  const targetRoles = jobProfiles.filter((p) => job.profiles.includes(p.id)).map((p) => p.name);
+  const input = { ...job, targetRoles, description: job.description ?? '' };
+  return { input, cacheKey: analysisCacheKey(input, profile, provider) };
+}
+
+// Every described job not scored yet (with `force`, scored ones too), for `npm run analyze`.
 export async function analyzeJobs(
   db: DatabaseSync,
   profile: Profile,
@@ -73,12 +90,7 @@ export async function analyzeJobs(
     onProgress?: (progress: AnalysisProgress) => void;
   },
 ): Promise<AnalysisSummary> {
-  const names = new Map(jobProfiles.map((p) => [p.id, p.name]));
-  const jobs = jobsToAnalyze(db, { force, scope }).map((job) => {
-    const targetRoles = job.profiles.map((id) => names.get(id)).filter((name): name is string => Boolean(name));
-    const input = { ...job, targetRoles, description: job.description ?? '' };
-    return { job, input, cacheKey: analysisCacheKey(input, profile, provider) };
-  });
+  const jobs = jobsToAnalyze(db, { force, scope }).map((job) => ({ job, ...analysisInput(job, profile, provider, jobProfiles) }));
   const summary: AnalysisSummary = { attempted: 0, succeeded: 0, failed: 0, cacheHits: 0, cacheMisses: 0, averageMs: null, modelChecked: false };
   if (!jobs.length) return summary;
 
@@ -139,10 +151,7 @@ export async function analyzeJobs(
         summary.failed++;
         if (!reused) summary.cacheMisses++;
         const message = (err as Error).message;
-        // A failed re-analysis keeps the job's earlier verdict; only unscored jobs are marked failed.
-        if (job.status === 'DISCOVERED' || job.status === 'ANALYSIS_FAILED') {
-          updateJobStatus(db, job.id, 'ANALYSIS_FAILED', { matchScore: null, filterReason: null, analysisError: message });
-        }
+        markAnalysisFailed(db, job.id, message);
         log.info(`[${summary.succeeded + summary.failed}/${jobs.length}] ${job.title} · ${job.company}`);
         log.warn(`       ✗ Analysis failed: ${message}`);
         report(job, null, message);
@@ -156,6 +165,49 @@ export async function analyzeJobs(
 
   summary.averageMs = modelTimes.length ? modelTimes.reduce((a, b) => a + b, 0) / modelTimes.length : null;
   return summary;
+}
+
+// Scores eligible jobs one at a time while a run applies, so the AI never holds up searching or
+// applying. Unrelated jobs never reach it, a job is never scored twice, and it stops with the run.
+export async function matchInBackground(
+  db: DatabaseSync,
+  profile: Profile,
+  env: Env,
+  { provider, jobProfiles, scope, signal }: { provider: JobAnalysisProvider; jobProfiles: JobProfile[]; scope: JobScope; signal: AbortSignal },
+): Promise<{ matched: number; failed: number }> {
+  let matched = 0;
+  let failed = 0;
+  let checked = false;
+  try {
+    while (!signal.aborted) {
+      const job = nextJobToMatch(db, scope);
+      if (!job) break;
+      const { input, cacheKey } = analysisInput(job, profile, provider, jobProfiles);
+      const cached = parseEvidence(cachedEvidence(db, cacheKey));
+      try {
+        if (!('evidence' in cached) && !checked) {
+          await provider.ensureReady();
+          checked = true;
+        }
+        const evidence = 'evidence' in cached ? cached.evidence : await provider.analyze(input, profile, signal);
+        const score = recordAnalysis(db, job, profile, env, provider, cacheKey, evidence, jobProfiles);
+        matched++;
+        log.info(`AI match ${score}: ${job.title} · ${job.company}`);
+      } catch (err) {
+        if (signal.aborted) break;
+        if (err instanceof AiError && err.fatal) {
+          log.warn(`AI matching is off for this run: ${err.message.split('\n')[0]}`);
+          break;
+        }
+        failed++;
+        markAnalysisFailed(db, job.id, (err as Error).message);
+        log.warn(`AI match failed for ${job.title} · ${job.company}: ${(err as Error).message}`);
+      }
+    }
+  } finally {
+    if (checked) await provider.release?.();
+  }
+  return { matched, failed };
 }
 
 function recordAnalysis(
@@ -181,7 +233,9 @@ function recordAnalysis(
       evidence: JSON.stringify(evidence),
       result,
     });
-    updateJobStatus(db, job.id, result.status, { matchScore: result.score, filterReason: null });
+    // The run may have applied to the job while the model worked on it; that status stays.
+    if (jobStatus(db, job.id) === 'APPLIED') setMatchScore(db, job.id, result.score);
+    else updateJobStatus(db, job.id, result.status, { matchScore: result.score, filterReason: null });
     db.exec('COMMIT');
   } catch (err) {
     db.exec('ROLLBACK');

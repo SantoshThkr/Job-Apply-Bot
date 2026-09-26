@@ -1,6 +1,6 @@
 'use client';
 
-import { FINAL_EVENTS, type AnalysisProgressEvent, type BotEvent, type BotState, type LogEvent, type RunEvent } from '@bot/domain';
+import { FINAL_EVENTS, type AnalysisProgressEvent, type BotEvent, type BotState, type LogEvent, type RunEvent, type SearchProgressEvent } from '@bot/domain';
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
 
 const LOG_LIMIT = 200;
@@ -13,14 +13,24 @@ export interface Live {
   // run through a thousand jobs doesn't pile up in the page.
   run: RunEvent[];
   analysis: AnalysisProgressEvent | null;
+  search: SearchProgressEvent | null;
   // Bumps whenever stored data changed (an attempt or a run finished), so views refetch.
   version: number;
 }
 
-const initial: Live = { connected: false, state: null, log: [], run: [], analysis: null, version: 0 };
+const initial: Live = { connected: false, state: null, log: [], run: [], analysis: null, search: null, version: 0 };
 const LiveContext = createContext<Live>(initial);
 
-const DATA_CHANGES = new Set<BotEvent['type']>([...Object.values(FINAL_EVENTS), 'RUN_STARTED', 'RUN_STOPPED', 'RUN_COMPLETED', 'RUN_FAILED', 'RUN_PAUSED']);
+const DATA_CHANGES = new Set<BotEvent['type']>([
+  ...Object.values(FINAL_EVENTS),
+  'RUN_STARTED',
+  'SEARCH_FINISHED',
+  'QUEUE_READY',
+  'RUN_STOPPED',
+  'RUN_COMPLETED',
+  'RUN_FAILED',
+  'RUN_PAUSED',
+]);
 
 export function reduce(live: Live, event: BotEvent): Live {
   switch (event.type) {
@@ -30,6 +40,9 @@ export function reduce(live: Live, event: BotEvent): Live {
       return { ...live, log: [...live.log.slice(-(LOG_LIMIT - 1)), event] };
     case 'ANALYSIS_PROGRESS':
       return { ...live, analysis: event };
+    case 'SEARCH_PROGRESS':
+      // New jobs are stored as each page arrives; views refetch to show them.
+      return { ...live, search: event, version: live.version + (event.added !== live.search?.added ? 1 : 0) };
     default: {
       const sameRun = event.type !== 'RUN_STARTED' && live.run[0]?.runId === event.runId;
       const kept = !sameRun ? [] : event.type === 'JOB_STARTED' ? live.run.filter((e) => e.applicationId === undefined) : live.run;
@@ -37,6 +50,7 @@ export function reduce(live: Live, event: BotEvent): Live {
         ...live,
         run: [...kept, event],
         analysis: event.type === 'RUN_STARTED' ? null : live.analysis,
+        search: event.type === 'RUN_STARTED' ? null : live.search,
         version: live.version + (DATA_CHANGES.has(event.type) ? 1 : 0),
       };
     }

@@ -16,10 +16,11 @@ import {
   type Reply,
 } from '../browser/apply.ts';
 import { saveStepScreenshot } from '../browser/browser.ts';
+import { postingDetails } from '../browser/job-details.ts';
 import { RunStopped } from '../browser/session.ts';
 import type { Answer } from '../config.ts';
-import { applicationQueue, previousApplication, startApplication, updateApplication, type ApplicationChanges, type QueueItem } from '../db/applications.ts';
-import { markJobApplied } from '../db/jobs.ts';
+import { previousApplication, startApplication, updateApplication, type ApplicationChanges, type QueueItem } from '../db/applications.ts';
+import { markJobApplied, saveJobDetails } from '../db/jobs.ts';
 import { FINAL_EVENTS, domainOf, type ApplicationStatus, type ApplySettings, type FailureCode, type RunEvent, type RunEventType } from '../domain.ts';
 import { recordRunEvent } from '../events.ts';
 import { log } from '../logger.ts';
@@ -52,31 +53,30 @@ export function isAnsweredBy(answers: Answer[], facts: ApplicantFacts | null = n
   return (question) => answerFor(question, answers, facts) !== null;
 }
 
-// Works through every job in the queue, freshest first, until it is done, stopped, or Naukri makes
-// continuing unsafe. `settings.limit` is only for trying one or two jobs from the command line.
-export async function applyToJobs(ctx: ApplyContext, stats: Record<string, number>): Promise<void> {
-  const { jobs: queued, excluded } = applicationQueue(ctx.db, {
-    scope: ctx.settings,
-    minMatchScore: ctx.settings.minMatchScore,
-    isAnswered: isAnsweredBy(ctx.answers, ctx.facts),
-  });
-  const jobs = ctx.settings.limit ? queued.slice(0, ctx.settings.limit) : queued;
-  stats.queued = jobs.length;
-  stats.excluded = excluded.length;
-  log.info(`${jobs.length} job(s) queued at match ${ctx.settings.minMatchScore}+${excluded.length ? `, ${excluded.length} left out` : ''}`);
-
+// Works through the queue, freshest first, until it is done, stopped, or Naukri makes continuing
+// unsafe. `settings.limit` is only for trying one or two jobs from the command line.
+export async function applyToJobs(ctx: ApplyContext, queue: QueueItem[], stats: Record<string, number>): Promise<void> {
+  const jobs = ctx.settings.limit ? queue.slice(0, ctx.settings.limit) : queue;
   let unverified = 0;
   let clickedLast = false;
   for (const [index, job] of jobs.entries()) {
     await ctx.whilePaused?.();
     if (ctx.signal?.aborted) break;
+    // The background AI may have scored it since the queue was built.
+    const score = currentScore(ctx.db, job.jobId);
+    if (score !== null && score < ctx.settings.minMatchScore) {
+      stats.skippedLowMatch = (stats.skippedLowMatch ?? 0) + 1;
+      log.info(`Skipped ${job.title} · ${job.company}: AI match ${score} is below ${ctx.settings.minMatchScore}`);
+      continue;
+    }
     if (index > 0) {
       const [min, max] = ctx.browseDelayMs ?? [1_500, 4_000];
       const ms = clickedLast ? ctx.settings.delaySeconds * 1_000 : min + Math.random() * (max - min);
       if (!(await pause(ms, ctx.signal))) break;
     }
-    const attempt = new Attempt(ctx, job, index + 1, jobs.length);
+    const attempt = new Attempt(ctx, job, index + 1, jobs.length, jobs[index + 1]);
     const status = await attempt.run();
+    await closeOtherTabs(ctx.page);
     clickedLast = attempt.clicked;
     stats.processed = index + 1;
     unverified = status === 'NEEDS_REVIEW' && attempt.possiblySent ? unverified + 1 : 0;
@@ -87,6 +87,16 @@ export async function applyToJobs(ctx: ApplyContext, stats: Record<string, numbe
       );
     }
   }
+}
+
+function currentScore(db: DatabaseSync, jobId: number): number | null {
+  return (db.prepare('SELECT match_score AS score FROM jobs WHERE id = ?').get(jobId) as { score: number | null } | undefined)?.score ?? null;
+}
+
+// Pages Naukri or a company site opened on the side; one tab is all a run needs.
+async function closeOtherTabs(page: Page): Promise<void> {
+  if (page.isClosed()) return;
+  for (const tab of page.context().pages()) if (tab !== page) await tab.close().catch(() => {});
 }
 
 // False when the run was stopped during the wait.
@@ -125,12 +135,13 @@ class Attempt {
     submitClicked: false,
   };
 
-  constructor(ctx: ApplyContext, job: QueueItem, position: number, total: number) {
+  constructor(ctx: ApplyContext, job: QueueItem, position: number, total: number, next?: QueueItem) {
     this.#ctx = ctx;
     this.#job = job;
     this.#position = position;
     this.#id = startApplication(ctx.db, ctx.runId, job);
-    this.#event('JOB_STARTED', `Started ${position}/${total}: ${job.title}`, { detail: { position, total, score: job.score } });
+    const detail = { position, total, score: job.score, ...(next && { nextCompany: next.company, nextTitle: next.title }) };
+    this.#event('JOB_STARTED', `Started ${position}/${total}: ${job.title}`, { detail });
   }
 
   get clicked(): boolean {
@@ -183,6 +194,11 @@ class Attempt {
     const state = await openJobPage(page, job.url, this.#waits);
     this.#event('JOB_OPENED', 'Job opened');
     await this.#screenshot('before-apply');
+    // Kept for the AI match; reading it costs nothing now that the page is open.
+    if (!job.hasDescription) {
+      const details = await postingDetails(page);
+      if (details) saveJobDetails(db, job.jobId, details);
+    }
     switch (state.kind) {
       case 'ALREADY_APPLIED':
         markJobApplied(db, job.jobId);
@@ -339,12 +355,12 @@ class Attempt {
     const notAnOption = () => review('ANSWER_NOT_IN_OPTIONS', `The configured answer "${configured}" is not one of: ${question.options.join(' | ')}`);
     if (question.kind === 'multi') {
       const picked = (configured ?? '').split(',').map((a) => pickOption(question.options, a.trim()));
-      if (!configured) return review('UNKNOWN_REQUIRED_QUESTION', 'No answer for this question in config/answers.json');
+      if (!configured) return review('UNKNOWN_REQUIRED_QUESTION', 'No saved answer for this question (Profile page, Application answers)');
       return picked.every(Boolean) ? { options: picked as string[] } : notAnOption();
     }
     const answer = answerFor(question.text, answers, facts, question.options);
     if (answer) return question.kind === 'text' ? { text: answer } : { options: [answer] };
-    return configured ? notAnOption() : review('UNKNOWN_REQUIRED_QUESTION', 'No answer for this question in config/answers.json or your profile');
+    return configured ? notAnOption() : review('UNKNOWN_REQUIRED_QUESTION', 'No answer for this question in your profile or saved answers');
   }
 
   // A form with its own submit button: fill what is known, stop at anything required that isn't, and

@@ -27,6 +27,27 @@ export function posted(value: string | null, now = new Date()): string {
   return days === 1 ? '1 day ago' : `${days} days ago`;
 }
 
-export const FRESHNESS_LABELS: Record<Freshness, string> = { today: 'Today', '24h': '24 hours', '3d': '3 days', '7d': '7 days', all: 'All' };
+export const FRESHNESS_LABELS: Record<Freshness, string> = {
+  today: 'Today',
+  '24h': '24 hours',
+  '2d': '2 days',
+  '3d': '3 days',
+  '7d': '7 days',
+  custom: 'Custom',
+  all: 'Any time',
+};
+
+// "Last 24 hours", "Sep 20 to Sep 26".
+export function freshnessText({ freshness, from, to }: { freshness: Freshness; from?: string | null; to?: string | null }): string {
+  if (freshness !== 'custom') return freshness === 'all' || freshness === 'today' ? FRESHNESS_LABELS[freshness] : `Last ${FRESHNESS_LABELS[freshness]}`;
+  const day = (value: string) => new Date(`${value}T00:00`).toLocaleDateString([], { month: 'short', day: 'numeric' });
+  return from ? `${day(from)} to ${to ? day(to) : 'today'}` : 'Custom dates';
+}
+
+// "7 years ± 6 months".
+export function experienceText(years: number | null, months: number): string {
+  if (years === null) return 'Any experience';
+  return months ? `${years} years + ${months} months` : `${years} years`;
+}
 
 export const label = (value: string) => value.replaceAll('_', ' ');

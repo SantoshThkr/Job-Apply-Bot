@@ -54,15 +54,25 @@ export class OllamaJobAnalysisProvider implements JobAnalysisProvider {
     }
   }
 
-  analyze(job: JobForAnalysis, profile: Profile): Promise<MatchEvidence> {
+  analyze(job: JobForAnalysis, profile: Profile, signal?: AbortSignal): Promise<MatchEvidence> {
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: buildUserMessage(job, profile) },
     ];
-    return completeWithValidation(this.#attempts, job.title, () => this.#chat(messages));
+    return completeWithValidation(this.#attempts, job.title, () => this.#chat(messages, signal));
   }
 
-  async #chat(messages: object[]): Promise<string> {
+  // Ollama keeps a model in memory for minutes after the last request; this unloads it at once.
+  async release(): Promise<void> {
+    await this.#fetch(`${this.endpoint}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: this.model, keep_alive: 0 }),
+      signal: AbortSignal.timeout(5_000),
+    }).catch(() => {});
+  }
+
+  async #chat(messages: object[], signal?: AbortSignal): Promise<string> {
     const body = {
       model: this.model,
       messages,
@@ -80,9 +90,10 @@ export class OllamaJobAnalysisProvider implements JobAnalysisProvider {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]) : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (err) {
+      if (signal?.aborted) throw new AiError('Stopped', true);
       if ((err as Error).name === 'TimeoutError') throw new AiError(`no answer within ${REQUEST_TIMEOUT_MS / 1_000}s`, false);
       throw new AiError(`Ollama stopped responding at ${this.endpoint}. Check that it is still running.`, true);
     }
@@ -94,7 +105,7 @@ export class OllamaJobAnalysisProvider implements JobAnalysisProvider {
     // Older Ollama versions and non-thinking models may reject the think option; drop it and ask again.
     if (response.status === 400 && this.#sendThink && /think/i.test(payload?.error ?? '')) {
       this.#sendThink = false;
-      return this.#chat(messages);
+      return this.#chat(messages, signal);
     }
     if (!response.ok) throw new AiError(`Ollama error ${response.status}: ${payload?.error ?? response.statusText}`, false);
 

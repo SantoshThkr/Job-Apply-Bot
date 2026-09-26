@@ -4,16 +4,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  applicationSummary,
+  applicationQueue,
   canTransitionApplication,
-  dashboardCounts,
   listApplications,
   runOutcomes,
+  scopeSummary,
   startApplication,
   updateApplication,
 } from '../src/db/applications.ts';
 import { MIGRATIONS, openDatabase } from '../src/db/database.ts';
-import { getJobDetail, insertJob, listJobs, setJobProfiles, updateJobStatus } from '../src/db/jobs.ts';
+import { getJobDetail, insertJob, listJobs, setJobClassification, updateJobStatus } from '../src/db/jobs.ts';
+import { jobCities } from '../src/jobs/filtering.ts';
 import { closeAbandonedRuns, createRun, finishRun, getRun, listRuns, setRunPaused } from '../src/db/runs.ts';
 import { APPLICATION_STATUSES, OUTCOMES, type ApplicationStatus, type JobScope } from '../src/domain.ts';
 import { normalizeCard } from '../src/jobs/normalization.ts';
@@ -29,26 +30,35 @@ afterEach(() => {
 const HOUR = 3_600_000;
 const ALL: JobScope = { profiles: [], freshness: 'all' };
 
+// A job as a search stores it and sorting files it: in the "react" profile, in Pune, scored 80 by
+// the AI unless `status` is DISCOVERED.
 function addJob(
   id: string,
-  { title = 'AI Engineer', company = `Company ${id}`, status = 'SHORTLISTED', score = 80, hoursAgo = 1, profiles = ['react'] } = {},
+  {
+    title = 'AI Engineer',
+    company = `Company ${id}`,
+    status = 'SHORTLISTED',
+    score = 80,
+    hoursAgo = 1,
+    profiles = ['react'],
+    location = 'Pune',
+    experience = '5-9 Yrs',
+  } = {},
 ): number {
-  const externalId = id.padStart(12, '1');
+  const externalId = id.padStart(12, '0');
   const card = normalizeCard({
     externalId,
     url: `https://www.naukri.com/job-listings-x-${externalId}`,
     title,
     company,
-    location: 'Pune',
-    experience: '5-9 Yrs',
+    location,
+    experience,
     posted: Date.now() - hoursAgo * HOUR,
-  });
-  insertJob(db, card!, 'test');
+  })!;
+  insertJob(db, card, 'test');
   const { id: jobId } = db.prepare('SELECT id FROM jobs WHERE external_id = ?').get(externalId) as { id: number };
-  if (status !== 'DISCOVERED') {
-    updateJobStatus(db, jobId, status as 'SHORTLISTED', { matchScore: status === 'SKIPPED' ? null : score, filterReason: null });
-  }
-  setJobProfiles(db, jobId, profiles);
+  if (status !== 'DISCOVERED') updateJobStatus(db, jobId, status as 'SHORTLISTED', { matchScore: score, filterReason: null });
+  setJobClassification(db, jobId, { profiles, cities: jobCities(card) });
   return jobId;
 }
 
@@ -168,46 +178,96 @@ describe('counts and job lists', () => {
     attempt(run, addJob('3', { profiles: ['angular'] }), 'APPLY_CLICKED', 'FORM_OPENED', 'NEEDS_REVIEW');
     addJob('4');
     addJob('5', { hoursAgo: 72 });
+    // Never scored by the AI: applied to all the same.
     addJob('6', { status: 'DISCOVERED' });
     db.prepare('UPDATE jobs SET external_apply = 1 WHERE id = ?').run(addJob('7'));
     // Applied outside the bot: Naukri showed "Applied" on a job it never attempted.
     db.prepare(`UPDATE jobs SET status = 'APPLIED' WHERE id = ?`).run(addJob('8'));
+    addJob('9', { experience: '10-15 Yrs' });
+    addJob('10', { status: 'SKIPPED', score: 52 });
+    // Checked with auto apply off: still ready.
+    attempt(run, addJob('11'), 'READY_TO_APPLY');
+    // Relevant to no job profile: never in scope.
+    addJob('12', { profiles: [] });
 
-    const summary = (scope: JobScope) => applicationSummary(db, { scope, minMatchScore: 75, isAnswered: () => false });
-    expect(summary(ALL)).toEqual({
-      counts: { ready: 2, applying: 0, applied: 1, failed: 1, external: 1, review: 1, already_applied: 1 },
-      // The two ready ones plus the failure, which is retried.
-      queued: 3,
-      awaitingMatch: 1,
+    const summary = (scope: JobScope) => scopeSummary(db, { scope, minMatchScore: 75, isAnswered: () => false });
+    expect(summary({ ...ALL, experienceYears: 7, toleranceMonths: 6 })).toEqual({
+      found: 11,
+      eligible: 9,
+      counts: { ready: 4, applying: 0, applied: 1, failed: 1, external: 1, review: 1, already_applied: 1, not_eligible: 2 },
+      // The four ready ones plus the failure, which is retried.
+      queued: 5,
     });
-    expect(summary({ profiles: ['angular'], freshness: 'all' }).counts).toMatchObject({ review: 1, ready: 0 });
-    expect(summary({ profiles: [], freshness: '24h' }).counts.ready).toBe(1);
-    // Like the Apply page: the job applied outside the bot is not counted as Applied.
-    expect(dashboardCounts(db)).toEqual({ jobsFound: 8, freshJobs: 7, applied: 1, failed: 1 });
+    // Without an experience check only the low AI match is left out.
+    expect(summary(ALL)).toMatchObject({ eligible: 10, queued: 6, counts: { ready: 5, not_eligible: 1 } });
+    expect(summary({ profiles: ['angular'], freshness: 'all' })).toMatchObject({ found: 1, counts: { review: 1, ready: 0 } });
+    expect(summary({ profiles: [], freshness: '24h' }).counts.ready).toBe(4);
   });
 
-  it('lists jobs still to act on first, freshest first, within the scope', () => {
-    const run = createRun(db, 'APPLY', {});
-    const applied = addJob('1', { company: 'Applied Yesterday', hoursAgo: 20 });
-    attempt(run, applied, 'APPLY_CLICKED', 'SUBMIT_CLICKED', 'APPLIED');
-    db.prepare(`UPDATE jobs SET status = 'APPLIED' WHERE id = ?`).run(applied);
-    addJob('2', { company: 'Ready Old', hoursAgo: 50 });
-    addJob('3', { company: 'Ready New', hoursAgo: 2 });
-    addJob('4', { company: 'Not Matched Yet', status: 'DISCOVERED', hoursAgo: 1 });
-    addJob('5', { company: 'Angular Ready', hoursAgo: 3, profiles: ['angular'] });
-    addJob('6', { company: 'Low Match', status: 'REVIEW', hoursAgo: 1 });
+  it('checks experience against the years plus the tolerance, and never hides a job for it', () => {
+    for (const [id, experience] of [
+      ['1', '0-2 Yrs'],
+      ['2', '3-7 Yrs'],
+      ['3', '7-12 Yrs'],
+      ['4', '7.5-9 Yrs'],
+      ['5', '8-10 Yrs'],
+      ['6', '10+ Yrs'],
+      ['7', ''],
+    ]) {
+      addJob(id!, { company: `Needs ${experience || 'nothing stated'}`, experience: experience!, status: 'DISCOVERED' });
+    }
+    const ready = (experienceYears: number, toleranceMonths: number) =>
+      listJobs(db, { scope: { ...ALL, experienceYears, toleranceMonths } })
+        .jobs.filter((job) => job.category === 'ready')
+        .map((job) => job.company)
+        .sort();
+    expect(ready(7, 6)).toEqual(['Needs 0-2 Yrs', 'Needs 3-7 Yrs', 'Needs 7-12 Yrs', 'Needs 7.5-9 Yrs', 'Needs nothing stated']);
+    expect(ready(7, 0)).toEqual(['Needs 0-2 Yrs', 'Needs 3-7 Yrs', 'Needs 7-12 Yrs', 'Needs nothing stated']);
+    expect(ready(7, 12)).toContain('Needs 8-10 Yrs');
+
+    const { jobs, total } = listJobs(db, { scope: { ...ALL, experienceYears: 7, toleranceMonths: 6 } });
+    expect(total).toBe(7);
+    expect(jobs.find((job) => job.company === 'Needs 10+ Yrs')).toMatchObject({ category: 'not_eligible', ineligibleReason: 'Requires 10+ years' });
+    expect(jobs.find((job) => job.company === 'Needs 3-7 Yrs')).toMatchObject({ category: 'ready', ineligibleReason: null });
+  });
+
+  it('leaves out jobs the AI scored below the minimum, but not jobs it has not scored', () => {
+    addJob('1', { company: 'Strong', score: 90 });
+    addJob('2', { company: 'Weak', status: 'SKIPPED', score: 40 });
+    addJob('3', { company: 'Unscored', status: 'DISCOVERED' });
+    const { jobs } = applicationQueue(db, { scope: ALL, minMatchScore: 75, isAnswered: () => false });
+    expect(jobs.map((job) => job.company).sort()).toEqual(['Strong', 'Unscored']);
+    expect(listJobs(db, { minMatchScore: 75, category: 'not_eligible' }).jobs).toMatchObject([
+      { company: 'Weak', ineligibleReason: 'AI match 40 is below 75' },
+    ]);
+  });
+
+  it('lists jobs freshest first within the chosen profiles, locations and dates', () => {
+    addJob('1', { company: 'Pune New', hoursAgo: 2 });
+    addJob('2', { company: 'Pune Old', hoursAgo: 50 });
+    addJob('3', { company: 'Bangalore', location: 'Bengaluru', hoursAgo: 3 });
+    addJob('4', { company: 'Remote', location: 'Remote', hoursAgo: 4 });
+    addJob('5', { company: 'Angular', profiles: ['angular'], hoursAgo: 1 });
+    addJob('6', { company: 'Noida', location: 'Noida', hoursAgo: 5 });
 
     const companies = (options: Parameters<typeof listJobs>[1]) => listJobs(db, options).jobs.map((j) => j.company);
-    expect(companies({})).toEqual(['Ready New', 'Angular Ready', 'Ready Old', 'Not Matched Yet', 'Low Match', 'Applied Yesterday']);
-    expect(companies({ scope: { profiles: ['react'], freshness: '24h' } })).toEqual(['Ready New', 'Not Matched Yet', 'Low Match', 'Applied Yesterday']);
-    expect(companies({ category: 'applied' })).toEqual(['Applied Yesterday']);
-    expect(companies({ category: 'new' })).toEqual(['Not Matched Yet']);
-    expect(listJobs(db, { limit: 2 })).toMatchObject({ total: 6, jobs: [{ company: 'Ready New', category: 'ready', profiles: ['react'] }, {}] });
+    expect(companies({})).toEqual(['Angular', 'Pune New', 'Bangalore', 'Remote', 'Noida', 'Pune Old']);
+    expect(companies({ scope: { profiles: ['react'], freshness: '24h' } })).toEqual(['Pune New', 'Bangalore', 'Remote', 'Noida']);
+    // Remote jobs always count; "Delhi NCR" covers Noida.
+    expect(companies({ scope: { ...ALL, locations: ['Bangalore'] } })).toEqual(['Bangalore', 'Remote']);
+    expect(companies({ scope: { ...ALL, locations: ['Delhi NCR'] } })).toEqual(['Remote', 'Noida']);
+    const day = new Date(Date.now() - 50 * HOUR).toLocaleDateString('en-CA');
+    expect(companies({ scope: { ...ALL, freshness: 'custom', from: day, to: day } })).toEqual(['Pune Old']);
+    expect(listJobs(db, { limit: 2 })).toMatchObject({ total: 6, jobs: [{ company: 'Angular', category: 'ready', profiles: ['angular'] }, {}] });
   });
 
-  it('returns a job with its details', () => {
-    const jobId = addJob('1');
+  it('returns a job with its details and whether it is eligible', () => {
+    const jobId = addJob('1', { experience: '10-15 Yrs' });
     expect(getJobDetail(db, jobId)).toMatchObject({ id: jobId, category: 'ready', analysis: null, externalUrl: null, profiles: ['react'] });
+    expect(getJobDetail(db, jobId, { scope: { ...ALL, experienceYears: 7, toleranceMonths: 6 } })).toMatchObject({
+      category: 'not_eligible',
+      ineligibleReason: 'Requires 10+ years',
+    });
     expect(getJobDetail(db, 999)).toBeUndefined();
     expect(listApplications(db, { jobId })).toEqual([]);
   });
@@ -273,6 +333,28 @@ describe('migrations', () => {
       // Experience no longer filters anything, so what it set aside is back for matching.
       expect(migrated.prepare('SELECT status, filter_reason AS reason FROM jobs WHERE id = 4').get()).toEqual({ status: 'DISCOVERED', reason: null });
       expect(migrated.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      migrated.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('adds the city list without touching existing jobs or attempts', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'naukri-bot-migrate-'));
+    try {
+      const file = join(dir, 'jobs.db');
+      const old = new DatabaseSync(file);
+      old.exec(`${MIGRATIONS.slice(0, 5).join(';\n')}; PRAGMA user_version = 5;`);
+      insertJob(old, card('111100000001'), 'AI');
+      old.exec(`INSERT INTO runs (id, kind, status, started_at) VALUES ('RUN-OLD', 'APPLY', 'COMPLETED', '2026-09-25T10:00:00Z');
+        INSERT INTO applications (run_id, job_id, status, started_at) VALUES ('RUN-OLD', 1, 'READY_TO_APPLY', 'x');`);
+      old.close();
+
+      const migrated = openDatabase(file);
+      expect(migrated.prepare('PRAGMA user_version').get()).toEqual({ user_version: 6 });
+      expect(migrated.prepare('SELECT title, cities FROM jobs').get()).toEqual({ title: 'AI Engineer', cities: '[]' });
+      expect(migrated.prepare('SELECT status FROM applications').get()).toEqual({ status: 'READY_TO_APPLY' });
+      expect(readdirSync(join(dir, 'backups'))[0]).toMatch(/^jobs-v5-/);
       migrated.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

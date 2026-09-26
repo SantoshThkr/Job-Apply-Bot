@@ -2,9 +2,9 @@ import type { JobProfile, Profile } from '../config.ts';
 import { canonicalLocation, splitLocations, type WorkMode } from './normalization.ts';
 import { skillMatcher } from './skills.ts';
 
-// Stage 1 of matching: cheap, deterministic checks on the search-card data, so obviously wrong jobs
-// never cost a page load or an AI call. Deliberately lenient: anything plausible goes on to the AI.
-// Experience is never checked; jobs with any experience range stay in.
+// Cheap, deterministic checks on the search-card data, so unrelated jobs never cost a page load or
+// an AI call. Location and experience depend on what the run asks for, so they are checked per run
+// (see IN_SCOPE and JOB_CATEGORY in src/db/jobs.ts), not here.
 
 export interface FilterableJob {
   title: string;
@@ -22,6 +22,18 @@ function withRegion(city: string): string[] {
 }
 
 const isRemote = (location: string) => canonicalLocation(location) === 'Remote';
+
+// The job's cities, canonical, with "Remote" for a remote job.
+export function jobCities(job: Pick<FilterableJob, 'location' | 'workMode'>): string[] {
+  const cities = splitLocations(job.location);
+  if (job.workMode === 'Remote' && !cities.includes('Remote')) cities.push('Remote');
+  return [...new Set(cities)];
+}
+
+// Every city name that counts as one of the chosen locations ("Delhi NCR" covers Noida and Gurugram).
+export function expandLocations(locations: string[]): string[] {
+  return [...new Set(locations.flatMap((l) => withRegion(canonicalLocation(l))))];
+}
 
 // null when the job doesn't say where it is.
 export function locationMatches(job: Pick<FilterableJob, 'location' | 'workMode'>, preferred: string[]): boolean | null {
@@ -92,11 +104,7 @@ export function matchingProfiles(job: Pick<FilterableJob, 'title' | 'skills'>, p
   return profiles.filter((profile) => profileMatches(job, profile)).map((profile) => profile.id);
 }
 
-// Returns why the job is set aside, or null when it should go on to AI analysis.
-export function hardFilterReason(job: FilterableJob, candidate: Pick<Profile, 'preferredLocations'>, profiles: string[]): string | null {
-  if (locationMatches(job, candidate.preferredLocations) === false) {
-    return `Not in your preferred locations (${job.location})`;
-  }
-  if (!profiles.length) return 'Title matches none of your job profiles';
-  return null;
+// Returns why the job is set aside, or null when it is relevant to at least one job profile.
+export function hardFilterReason(profiles: string[]): string | null {
+  return profiles.length ? null : 'Title matches none of your job profiles';
 }

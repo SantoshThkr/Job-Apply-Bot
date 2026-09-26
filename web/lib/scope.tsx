@@ -1,39 +1,96 @@
 'use client';
 
-import { FRESHNESS, type JobScope } from '@bot/domain';
+import { FRESHNESS, type JobScope, type ProfileResponse } from '@bot/domain';
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
+import { useApi } from './api';
 
-const KEY = 'job-bot:scope';
-const DEFAULT: JobScope = { profiles: [], freshness: 'all' };
+const KEY = 'job-bot:settings';
 
-const ScopeContext = createContext<{ scope: JobScope; setScope: (scope: JobScope) => void }>({ scope: DEFAULT, setScope: () => {} });
-
-// The profiles and freshness picked on the Jobs page, shared with the Apply page and remembered in
-// this browser only. Nothing else is stored client-side.
-export function ScopeProvider({ children }: { children: ReactNode }) {
-  const [scope, setScopeState] = useState<JobScope>(DEFAULT);
-
-  useEffect(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(KEY) ?? 'null') as JobScope | null;
-      if (saved && Array.isArray(saved.profiles) && FRESHNESS.includes(saved.freshness)) setScopeState(saved);
-    } catch {
-      // Private windows and blocked storage just start from the default.
-    }
-  }, []);
-
-  const setScope = useCallback((next: JobScope) => {
-    setScopeState(next);
-    try {
-      localStorage.setItem(KEY, JSON.stringify(next));
-    } catch {
-      // Remembering the choice is a convenience only.
-    }
-  }, []);
-
-  return <ScopeContext.Provider value={{ scope, setScope }}>{children}</ScopeContext.Provider>;
+export interface RunSettings extends Required<JobScope> {
+  autoApply: boolean;
 }
 
-export const useScope = () => useContext(ScopeContext);
+const DEFAULT: RunSettings = {
+  profiles: [],
+  locations: [],
+  freshness: '24h',
+  from: null,
+  to: null,
+  experienceYears: null,
+  toleranceMonths: 6,
+  autoApply: false,
+};
 
-export const scopeQuery = (scope: JobScope) => new URLSearchParams({ profiles: scope.profiles.join(','), freshness: scope.freshness }).toString();
+interface Settings {
+  settings: RunSettings;
+  setSettings: (patch: Partial<RunSettings>) => void;
+  profile: ProfileResponse | undefined;
+  reloadProfile: () => void;
+}
+
+const SettingsContext = createContext<Settings>({ settings: DEFAULT, setSettings: () => {}, profile: undefined, reloadProfile: () => {} });
+
+function saved(): Partial<RunSettings> | null {
+  try {
+    const value = JSON.parse(localStorage.getItem(KEY) ?? 'null') as Partial<RunSettings> | null;
+    return value && Array.isArray(value.profiles) && FRESHNESS.includes(value.freshness!) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+// What the next run searches for and applies to, shared by every page and remembered in this browser
+// only. Until something is picked, the defaults come from the profile.
+export function SettingsProvider({ children }: { children: ReactNode }) {
+  const { data: profile, error, reload: reloadProfile } = useApi<ProfileResponse>('/api/profile');
+  const [settings, setState] = useState<RunSettings>(DEFAULT);
+
+  useEffect(() => {
+    if (!profile && !error) return;
+    const defaults = profile?.defaults;
+    setState((current) => {
+      const fromProfile = defaults && { autoApply: defaults.autoApply, toleranceMonths: defaults.toleranceMonths };
+      const base = current === DEFAULT ? { ...DEFAULT, ...fromProfile, ...saved() } : current;
+      return {
+        ...base,
+        locations: base.locations.length ? base.locations : (defaults?.locations ?? []),
+        experienceYears: base.experienceYears ?? defaults?.experienceYears ?? null,
+      };
+    });
+  }, [profile, error]);
+
+  const setSettings = useCallback((patch: Partial<RunSettings>) => {
+    setState((current) => {
+      const next = { ...current, ...patch };
+      try {
+        localStorage.setItem(KEY, JSON.stringify(next));
+      } catch {
+        // Remembering the choice is a convenience only.
+      }
+      return next;
+    });
+  }, []);
+
+  return <SettingsContext.Provider value={{ settings, setSettings, profile, reloadProfile }}>{children}</SettingsContext.Provider>;
+}
+
+export const useSettings = () => useContext(SettingsContext);
+
+export function scopeQuery(settings: RunSettings): string {
+  const query = new URLSearchParams({
+    profiles: settings.profiles.join(','),
+    locations: settings.locations.join(','),
+    freshness: settings.freshness,
+    tolerance: String(settings.toleranceMonths),
+  });
+  if (settings.experienceYears !== null) query.set('experience', String(settings.experienceYears));
+  if (settings.freshness === 'custom') {
+    if (settings.from) query.set('from', settings.from);
+    if (settings.to) query.set('to', settings.to);
+  }
+  return query.toString();
+}
+
+export function scopeOf({ autoApply: _, ...scope }: RunSettings): JobScope {
+  return scope;
+}

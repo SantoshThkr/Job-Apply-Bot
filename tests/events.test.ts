@@ -85,7 +85,7 @@ describe('formatRunReport', () => {
       stopReason: 'Naukri is showing a security check (CAPTCHA/OTP).',
       stopCode: 'SECURITY_CHALLENGE',
       settings: {},
-      stats: { queued: 3 },
+      stats: { found: 40, new: 12, relevant: 9, eligible: 5, queued: 3 },
       outcomes: { ready: 0, applying: 0, applied: 1, failed: 1, external: 0, review: 0, already_applied: 0 },
       attempted: 2,
     };
@@ -93,7 +93,9 @@ describe('formatRunReport', () => {
       application({ id: 2, company: 'Beta', jobTitle: 'React Developer', status: 'FAILED', outcome: 'failed', failureCode: 'FORM_TIMEOUT', failureReason: 'The recruiter questions stopped responding' }),
       application({}),
     ]);
-    expect(report).toContain('APPLICATION RUN STOPPED');
+    expect(report).toContain('AUTO APPLY RUN STOPPED');
+    expect(report).toMatch(/Found by the search\s+40/);
+    expect(report).toMatch(/Eligible\s+5/);
     expect(report).toContain('Reason: Naukri is showing a security check');
     expect(report).toMatch(/Queued\s+3/);
     expect(report).toMatch(/Attempted\s+2/);

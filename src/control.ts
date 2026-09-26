@@ -5,12 +5,11 @@ import type { BrowserContext, Page } from 'playwright';
 import { createProvider } from './ai/providers.ts';
 import { firstPage, launchBrowser } from './browser/browser.ts';
 import { BLOCKED_MESSAGE, checkSession, waitForManualLogin } from './browser/session.ts';
-import { ConfigError, loadJobProfiles, loadProfile, paths, type Env } from './config.ts';
+import { ConfigError, DEFAULT_DIRS, loadJobProfiles, requireUserProfile, type Dirs, type Env } from './config.ts';
 import { setRunPaused } from './db/runs.ts';
 import type { Activity, BotState, JobScope, RunKind, SessionStatus, StopCode } from './domain.ts';
 import { publish, recordRunEvent } from './events.ts';
-import { planQueries } from './jobs/discovery.ts';
-import { applySettingsFrom, runApplications, runSearch, type TrackedRun } from './jobs/runs.ts';
+import { applySettingsFrom, runApplications, type TrackedRun } from './jobs/runs.ts';
 import { log } from './logger.ts';
 
 export class Busy extends Error {
@@ -23,7 +22,7 @@ const DESCRIPTIONS: Record<Activity, string> = {
   LOGIN: 'Waiting for you to log in to Naukri',
   SEARCH: 'A job search is running',
   ANALYZE: 'An AI analysis run is active',
-  APPLY: 'An application run is already active',
+  APPLY: 'An auto apply run is already active',
 };
 
 const SESSION_AFTER_STOP: Partial<Record<StopCode, SessionStatus>> = {
@@ -39,7 +38,7 @@ export class BotControl {
   #db: DatabaseSync;
   #env: Env;
   #launch: () => Promise<BrowserContext>;
-  #configDir: string;
+  #dirs: Dirs;
   #waitMs: number | undefined;
   #context: BrowserContext | null = null;
   #page: Page | null = null;
@@ -54,12 +53,12 @@ export class BotControl {
     db,
     env,
     launch,
-    configDir = paths.config,
+    dirs = DEFAULT_DIRS,
     waitMs,
-  }: { db: DatabaseSync; env: Env; launch?: () => Promise<BrowserContext>; configDir?: string; waitMs?: number }) {
+  }: { db: DatabaseSync; env: Env; launch?: () => Promise<BrowserContext>; dirs?: Dirs; waitMs?: number }) {
     this.#db = db;
     this.#env = env;
-    this.#configDir = configDir;
+    this.#dirs = dirs;
     this.#waitMs = waitMs;
     this.#launch = launch ?? (() => launchBrowser({ headless: env.HEADLESS, channel: env.BROWSER_CHANNEL, handleSignals: false }));
   }
@@ -194,34 +193,25 @@ export class BotControl {
   }
 
   jobProfiles() {
-    return loadJobProfiles(this.#configDir);
+    return loadJobProfiles(this.#dirs.config);
   }
 
-  // Searches Naukri for the chosen profiles, reads the new descriptions and matches them, so the
-  // jobs found can be applied to right after.
-  startSearch(scope: JobScope): Promise<string> {
-    const profile = loadProfile(this.#configDir);
-    const jobProfiles = this.jobProfiles();
-    const unknown = scope.profiles.filter((id) => !jobProfiles.some((p) => p.id === id));
+  // Searches Naukri for the chosen profiles, locations and dates, then applies to every eligible job
+  // it has, freshest first. `autoApply` off stops each job before Apply.
+  startAutoApply(request: JobScope & { autoApply: boolean }): Promise<string> {
+    requireUserProfile(this.#dirs);
+    const unknown = request.profiles.filter((id) => !this.jobProfiles().some((p) => p.id === id));
     if (unknown.length) throw new ConfigError(`Unknown job profile: ${unknown.join(', ')}`);
-    const chosen = scope.profiles.length ? jobProfiles.filter((p) => scope.profiles.includes(p.id)) : jobProfiles;
-    const queries = planQueries(chosen, profile, { freshness: scope.freshness });
-    const provider = createProvider(this.#env);
-    return this.#startRun('SEARCH', (page, signal) =>
-      runSearch(page!, this.#db, this.#env, profile, jobProfiles, queries, { scope, provider, signal }),
-    );
-  }
-
-  // Works through every eligible job in scope; `autoApply` comes from the Apply page each time.
-  startApplications(request: JobScope & { autoApply: boolean }): Promise<string> {
+    if (request.freshness === 'custom' && !request.from) throw new ConfigError('Pick a start date for the custom range');
     const settings = { ...applySettingsFrom(this.#env, request), autoApply: request.autoApply };
     return this.#startRun('APPLY', (page, signal) =>
-      runApplications(page!, this.#db, settings, {
+      runApplications(page!, this.#db, this.#env, settings, {
         signal,
         whilePaused: () => this.#paused?.promise ?? Promise.resolve(),
         browseDelayMs: [this.#env.DELAY_MIN_MS, this.#env.DELAY_MAX_MS],
-        configDir: this.#configDir,
+        dirs: this.#dirs,
         waitMs: this.#waitMs,
+        provider: createProvider(this.#env),
       }),
     );
   }

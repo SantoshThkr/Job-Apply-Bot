@@ -8,18 +8,29 @@ node_modules/
 # Personal config: only the *.example.json templates are public
 config/*.json
 !config/*.example.json
+user-profile.json
+answers.json
 
-# Resume: only the placement instructions are public
+# Resumes, wherever they are put
 resume/*
 !resume/README.md
+*.pdf
+*.doc
+*.docx
 
-# Browser profile (Naukri session), database, application history
-data/
+# Everything personal lives in data/: profile, answers, resume, browser profile (Naukri session),
+# database, backups, debug screenshots. Only the two templates are public.
+data/*
+!data/user-profile.example.json
+!data/answers.example.json
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 *storage-state*.json
 *storageState*.json
+cookies*.json
 *.har
 
 # Debug artifacts can show account details

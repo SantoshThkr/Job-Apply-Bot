@@ -29,7 +29,10 @@ export interface JobAnalysisProvider {
   readonly endpoint: string;
   // Throws a fatal AiError with instructions when requests can't work (server down, model missing, no key).
   ensureReady(): Promise<void>;
-  analyze(job: JobForAnalysis, profile: Profile): Promise<MatchEvidence>;
+  // Aborting `signal` cancels the request in flight with a fatal AiError.
+  analyze(job: JobForAnalysis, profile: Profile, signal?: AbortSignal): Promise<MatchEvidence>;
+  // Frees what the provider holds between runs (Ollama unloads the model from memory).
+  release?(): Promise<void>;
 }
 
 export class AiError extends Error {

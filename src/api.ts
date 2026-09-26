@@ -1,22 +1,37 @@
-import { existsSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
 import { createProvider } from './ai/providers.ts';
-import { ConfigError, loadAnswers, loadJobProfiles, loadProfile, loadResume, paths, type Env } from './config.ts';
+import {
+  ConfigError,
+  DEFAULT_DIRS,
+  MAX_RESUME_BYTES,
+  answersSchema,
+  loadAnswers,
+  loadUserProfile,
+  matchProfile,
+  resumeInfo,
+  saveAnswers,
+  saveResume,
+  saveUserProfile,
+  type Dirs,
+  type Env,
+  type LoadedProfile,
+} from './config.ts';
 import { BotControl, Busy } from './control.ts';
-import { applicationSummary, dashboardCounts, getApplication, listApplications } from './db/applications.ts';
+import { getApplication, listApplications, scopeSummary } from './db/applications.ts';
 import { getJobDetail, listJobs } from './db/jobs.ts';
 import { getRun, listRuns, runEvents } from './db/runs.ts';
 import {
+  CATEGORY_LABELS,
   FRESHNESS,
   RUN_KINDS,
-  type ApplicationSummary,
   type BotEvent,
   type JobCategory,
   type JobProfileSummary,
   type JobScope,
+  type ProfileResponse,
+  type ScopeSummary,
   type StatusResponse,
 } from './domain.ts';
 import { events, formatSse, publish } from './events.ts';
@@ -32,12 +47,22 @@ class HttpError extends Error {
   }
 }
 
-const scopeSchema = z.strictObject({
-  profiles: z.array(z.string()).max(50).default([]),
-  freshness: z.enum(FRESHNESS).default('all'),
-});
-const applySchema = scopeSchema.extend({ autoApply: z.boolean() });
-const CATEGORIES: (JobCategory | 'all')[] = ['all', 'ready', 'applying', 'applied', 'failed', 'external', 'review', 'already_applied', 'new', 'low_match', 'filtered'];
+const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'a date as YYYY-MM-DD');
+const scopeSchema = z
+  .strictObject({
+    profiles: z.array(z.string()).max(50).default([]),
+    locations: z.array(z.string().trim().min(1).max(60)).max(30).default([]),
+    freshness: z.enum(FRESHNESS).default('24h'),
+    from: day.nullable().default(null),
+    to: day.nullable().default(null),
+    experienceYears: z.number().min(0).max(60).nullable().default(null),
+    toleranceMonths: z.number().int().min(0).max(60).default(6),
+  })
+  .refine((s) => !s.from || !s.to || s.from <= s.to, { message: 'The date range ends before it starts', path: ['to'] });
+const startSchema = z.strictObject({ scope: scopeSchema, autoApply: z.boolean() });
+const profileSchema = z.strictObject({ profile: z.unknown(), answers: z.unknown() });
+const resumeSchema = z.strictObject({ name: z.string().min(1).max(200), data: z.base64() });
+const CATEGORIES: (JobCategory | 'all')[] = ['all', ...(Object.keys(CATEGORY_LABELS) as JobCategory[])];
 
 // Only this machine: a page on another site can't reach the API through the user's browser
 // (Host check against DNS rebinding, Origin check, JSON-only writes so forms can't post).
@@ -53,11 +78,11 @@ function guard(req: IncomingMessage): void {
   }
 }
 
-async function readJson(req: IncomingMessage): Promise<unknown> {
+async function readJson(req: IncomingMessage, limit = 65_536): Promise<unknown> {
   let body = '';
   for await (const chunk of req) {
     body += chunk;
-    if (body.length > 65_536) throw new HttpError(413, 'Request body too large');
+    if (body.length > limit) throw new HttpError(413, 'Request body too large');
   }
   try {
     return body ? JSON.parse(body) : {};
@@ -84,11 +109,21 @@ function intParam(url: URL, name: string, fallback: number, min: number, max: nu
   return value;
 }
 
-// ?profiles=react,angular&freshness=24h
+// ?profiles=react,angular&locations=Bangalore,Remote&freshness=custom&from=2026-09-20&to=2026-09-26&experience=7&tolerance=6
 function scopeParam(url: URL): JobScope {
+  const list = (name: string) => url.searchParams.get(name)?.split(',').filter(Boolean) ?? [];
+  const number = (name: string) => {
+    const raw = url.searchParams.get(name);
+    return raw === null || raw === '' ? undefined : Number(raw);
+  };
   return parse(scopeSchema, {
-    profiles: url.searchParams.get('profiles')?.split(',').filter(Boolean) ?? [],
-    freshness: url.searchParams.get('freshness') ?? 'all',
+    profiles: list('profiles'),
+    locations: list('locations'),
+    freshness: url.searchParams.get('freshness') ?? undefined,
+    from: url.searchParams.get('from') || null,
+    to: url.searchParams.get('to') || null,
+    experienceYears: number('experience') ?? null,
+    toleranceMonths: number('tolerance'),
   });
 }
 
@@ -101,57 +136,60 @@ function orElse<T, F>(load: () => T, fallback: F): T | F {
   }
 }
 
-// Config problems stated up front, so the Apply page can say what is missing before a run needs it.
-function configProblems(dir: string): string[] {
-  const problems: string[] = [];
-  const check = (load: () => unknown) => {
-    try {
-      load();
-    } catch (err) {
-      if (!(err instanceof ConfigError)) throw err;
-      problems.push(err.message);
-    }
-  };
-  check(() => loadProfile(dir));
-  check(() => loadJobProfiles(dir));
-  if (existsSync(join(dir, 'resume.json'))) check(() => loadResume(dir));
-  else problems.push('config/resume.json not found: forms that ask for a resume or contact details go to review.');
-  if (existsSync(join(dir, 'answers.json'))) check(() => loadAnswers(dir));
-  else problems.push('config/answers.json not found: recruiter questions only get answers your profile covers.');
-  return problems;
-}
-
 const RECENT_LIMIT = 300;
 
-export function createApi({
-  control,
-  db,
-  env,
-  configDir = paths.config,
-}: {
-  control: BotControl;
-  db: DatabaseSync;
-  env: Env;
-  configDir?: string;
-}): Server {
+export function createApi({ control, db, env, dirs = DEFAULT_DIRS }: { control: BotControl; db: DatabaseSync; env: Env; dirs?: Dirs }): Server {
   onLog((level, message) => publish({ type: 'LOG', level, message, runId: control.state.activeRun?.id, timestamp: new Date().toISOString() }));
 
   // Replayed to each new dashboard tab so it shows the current run's story, not a blank page.
   const recent: BotEvent[] = [];
   events.setMaxListeners(50);
   events.on('event', (event) => {
-    if (event.type === 'STATE') return;
+    if (event.type === 'STATE' || event.type === 'SEARCH_PROGRESS') return;
     recent.push(event);
     if (recent.length > RECENT_LIMIT) recent.shift();
   });
 
-  const summary = (scope: JobScope): ApplicationSummary => {
-    const { answers, facts } = orElse(() => loadApplicationConfig(configDir, orElse(() => loadProfile(configDir), null)), { answers: [], facts: null });
+  const profileState = (): ProfileResponse => {
+    let loaded: LoadedProfile | null = null;
+    const problems: string[] = [];
+    try {
+      loaded = loadUserProfile(dirs);
+    } catch (err) {
+      if (!(err instanceof ConfigError)) throw err;
+      problems.push(err.message);
+    }
+    const answers = orElse(() => loadAnswers(dirs), []);
+    const resume = resumeInfo(loaded?.resumePath ?? null);
+    const p = loaded?.profile;
+    if (!loaded && !problems.length) problems.push('Set up your profile on the Profile page before starting.');
+    if (p && !p.email) problems.push('No email in your profile: forms that ask for it go to Review.');
+    if (p && !p.phone) problems.push('No phone number in your profile: forms that ask for it go to Review.');
+    if (p && !resume) problems.push('No resume uploaded: forms that ask for one go to Review.');
+    if (p && !answers.length) problems.push('No saved application answers: recruiter questions only get answers your profile covers.');
+    if (loaded?.source === 'legacy') problems.push('Your profile is read from the older config/ files. Save it once on the Profile page to move it to data/.');
     return {
-      ...applicationSummary(db, { scope, minMatchScore: env.MIN_MATCH_SCORE, isAnswered: isAnsweredBy(answers, facts) }),
+      profile: p ?? null,
+      answers,
+      resume,
+      source: loaded?.source ?? null,
+      ready: Boolean(loaded),
+      problems,
+      defaults: {
+        autoApply: env.AUTO_APPLY,
+        locations: p ? matchProfile(p).preferredLocations : [],
+        experienceYears: p?.experienceYears ?? null,
+        toleranceMonths: p?.experienceToleranceMonths ?? 6,
+      },
+    };
+  };
+
+  const summary = (scope: JobScope): ScopeSummary => {
+    const { answers, facts } = orElse(() => loadApplicationConfig(dirs), { answers: [], facts: null });
+    return {
+      ...scopeSummary(db, { scope, minMatchScore: env.MIN_MATCH_SCORE, isAnswered: isAnsweredBy(answers, facts) }),
       minMatchScore: env.MIN_MATCH_SCORE,
-      autoApply: env.AUTO_APPLY,
-      problems: configProblems(configDir),
+      problems: profileState().problems,
     };
   };
 
@@ -192,13 +230,30 @@ export function createApi({
         const body: StatusResponse = {
           state: control.state,
           ai: { provider: provider.label, model: provider.model },
-          counts: dashboardCounts(db),
+          profileReady: profileState().ready,
           lastRun: listRuns(db, { kind: 'APPLY', limit: 1 })[0] ?? null,
         };
         return send(res, 200, body);
       }
       case 'GET /api/profiles':
         return send(res, 200, control.jobProfiles().map(({ id, name }): JobProfileSummary => ({ id, name })));
+
+      case 'GET /api/profile':
+        return send(res, 200, profileState());
+      case 'POST /api/profile': {
+        const body = parse(profileSchema, await readJson(req));
+        const answers = parse(answersSchema, body.answers);
+        saveUserProfile(body.profile, dirs);
+        saveAnswers(answers, dirs);
+        return send(res, 200, profileState());
+      }
+      case 'POST /api/profile/resume': {
+        const { name, data } = parse(resumeSchema, await readJson(req, Math.ceil((MAX_RESUME_BYTES * 4) / 3) + 1_024));
+        const file = saveResume(name, Buffer.from(data, 'base64'), dirs);
+        const loaded = orElse(() => loadUserProfile(dirs), null);
+        if (loaded?.source === 'data') saveUserProfile({ ...loaded.profile, resumeFile: file }, dirs);
+        return send(res, 200, { file });
+      }
 
       case 'POST /api/browser/start':
         await control.startBrowser();
@@ -212,6 +267,8 @@ export function createApi({
         control.startLogin();
         return send(res, 202, control.state);
 
+      case 'GET /api/summary':
+        return send(res, 200, summary(scopeParam(url)));
       case 'GET /api/jobs': {
         const category = (url.searchParams.get('status') ?? 'all') as JobCategory | 'all';
         if (!CATEGORIES.includes(category)) throw new HttpError(400, `status must be one of ${CATEGORIES.join(', ')}`);
@@ -220,6 +277,7 @@ export function createApi({
           200,
           listJobs(db, {
             scope: scopeParam(url),
+            minMatchScore: env.MIN_MATCH_SCORE,
             category,
             limit: intParam(url, 'limit', 100, 1, 500),
             offset: intParam(url, 'offset', 0, 0, 10_000_000),
@@ -227,23 +285,20 @@ export function createApi({
         );
       }
       case 'GET /api/jobs/:id': {
-        const job = getJobDetail(db, Number(id));
+        const job = getJobDetail(db, Number(id), { scope: scopeParam(url), minMatchScore: env.MIN_MATCH_SCORE });
         if (!job) throw new HttpError(404, `No job ${id}`);
         return send(res, 200, { ...job, applications: listApplications(db, { jobId: job.id }) });
       }
-      case 'POST /api/jobs/search':
-        return send(res, 202, { runId: await control.startSearch(parse(scopeSchema, await readJson(req))) });
-
-      case 'GET /api/applications/summary':
-        return send(res, 200, summary(scopeParam(url)));
-      case 'POST /api/applications/start':
-        return send(res, 202, { runId: await control.startApplications(parse(applySchema, await readJson(req))) });
       case 'GET /api/applications/:id': {
         const application = getApplication(db, Number(id));
         if (!application) throw new HttpError(404, `No application ${id}`);
         return send(res, 200, { ...application, events: runEvents(db, { applicationId: application.id }) });
       }
 
+      case 'POST /api/runs/start': {
+        const { scope, autoApply } = parse(startSchema, await readJson(req));
+        return send(res, 202, { runId: await control.startAutoApply({ ...scope, autoApply }) });
+      }
       case 'GET /api/runs': {
         const kind = url.searchParams.get('kind') ?? undefined;
         if (kind && !(RUN_KINDS as readonly string[]).includes(kind)) throw new HttpError(400, `kind must be one of ${RUN_KINDS.join(', ')}`);
@@ -252,10 +307,12 @@ export function createApi({
       case 'GET /api/runs/:id': {
         const run = getRun(db, runId!);
         if (!run) throw new HttpError(404, `No run ${runId}`);
-        return send(res, 200, { ...run, applications: listApplications(db, { runId: run.id }), events: runEvents(db, { runId: run.id }) });
+        // The latest attempts first; ?limit keeps a live page from refetching a thousand rows per job.
+        const limit = intParam(url, 'limit', -1, -1, 100_000);
+        return send(res, 200, { ...run, applications: listApplications(db, { runId: run.id, limit }), events: runEvents(db, { runId: run.id }) });
       }
       case 'POST /api/runs/pause':
-        if (!control.pauseRun()) throw new HttpError(409, 'No application run to pause');
+        if (!control.pauseRun()) throw new HttpError(409, 'No run to pause');
         return send(res, 202, control.state);
       case 'POST /api/runs/resume':
         if (!control.resumeRun()) throw new HttpError(409, 'No paused run to resume');

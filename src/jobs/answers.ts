@@ -1,7 +1,7 @@
 import type { Answer } from '../config.ts';
 
-// Questions and form fields are answered only from config/answers.json and from your own profile and
-// resume details. Nothing is guessed or generated: anything else sends the application to review.
+// Questions and form fields are answered only from your saved answers and your profile. Nothing is
+// guessed or generated: anything else sends the application to review.
 
 const normalize = (text: string) =>
   text
@@ -31,13 +31,17 @@ export function pickOption(options: string[], answer: string): string | null {
 
 export interface ApplicantFacts {
   name: string;
+  firstName?: string;
+  lastName?: string;
   experienceYears: number;
   skills: string[];
   email?: string;
   phone?: string;
   currentLocation?: string;
   currentTitle?: string;
+  currentCompany?: string;
   noticePeriodDays?: number;
+  currentSalary?: string;
   expectedSalary?: string;
 }
 
@@ -45,12 +49,16 @@ export interface ApplicantFacts {
 // total, "company name" is not your name, "preferred location" is not your current one.
 const FACT_FIELDS: [RegExp, (facts: ApplicantFacts) => string | number | undefined][] = [
   [/^(your |full |candidate )?name$/, (f) => f.name],
+  [/^first name$/, (f) => f.firstName],
+  [/^(last name|surname)$/, (f) => f.lastName],
   [/\be ?mail( id| address)?\b/, (f) => f.email],
   [/\b(mobile|phone)( number| no)?\b|\bcontact (number|no)\b/, (f) => f.phone],
   [/\bcurrent (city|location)\b|^(city|location)$/, (f) => f.currentLocation],
   [/\bcurrent (designation|role|job title|title)\b|^designation$/, (f) => f.currentTitle],
+  [/\bcurrent (company|employer|organi[sz]ation)( name)?\b/, (f) => f.currentCompany],
   [/\b(total|overall) (work |professional )?experience\b|^(years of )?experience( in years)?$/, (f) => f.experienceYears],
   [/\bnotice period\b/, (f) => f.noticePeriodDays],
+  [/\bcurrent (ctc|salary)\b/, (f) => f.currentSalary],
   [/\bexpected (ctc|salary)\b/, (f) => f.expectedSalary],
   [/^(key |your )?skills$/, (f) => (f.skills.length ? f.skills.join(', ') : undefined)],
 ];

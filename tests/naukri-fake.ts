@@ -37,6 +37,37 @@ export interface FakeJob {
 
 export const jobUrl = (id: string) => `https://www.naukri.com/job-listings-test-role-acme-bengaluru-5-to-9-years-${id}`;
 
+// A job as Naukri's search API lists it.
+export interface FakeCard {
+  id: string;
+  title: string;
+  company: string;
+  experience: string;
+  location: string;
+  hoursAgo?: number;
+  external?: boolean;
+}
+
+function searchApiJob(card: FakeCard) {
+  return {
+    jobId: card.id,
+    title: card.title,
+    companyName: card.company,
+    jdURL: new URL(jobUrl(card.id)).pathname,
+    placeholders: [
+      { type: 'experience', label: card.experience },
+      { type: 'location', label: card.location },
+    ],
+    createdDate: Date.now() - (card.hoursAgo ?? 1) * 3_600_000,
+    tagsAndSkills: 'React,TypeScript',
+    companyApplyJob: card.external ?? false,
+  };
+}
+
+// One page of results; it asks the search API for them with the page's filters, as Naukri's does.
+const SEARCH_PAGE = `<div class="pagination"><a disabled><span>Next</span></a></div>
+<script>fetch('/jobapi/v3/search?noOfResults=20&pageNo=1&' + location.search.slice(1))</script>`;
+
 // A form with fields the bot knows (from the applicant facts and answers the tests configure) and one
 // optional field it doesn't.
 const FORM_FIELDS = `
@@ -149,7 +180,7 @@ export interface FakeNaukri {
 export async function serveFakeNaukri(
   context: BrowserContext,
   jobs: FakeJob[] | (() => FakeJob[]),
-  { loggedIn = true } = {},
+  { loggedIn = true, search = [] }: { loggedIn?: boolean; search?: FakeCard[] | (() => FakeCard[]) } = {},
 ): Promise<FakeNaukri> {
   const state: FakeNaukri = { clicks: new Map(), answers: new Map(), forms: new Map(), applied: new Set() };
   const find = (id: string) => (typeof jobs === 'function' ? jobs() : jobs).find((job) => job.id === id);
@@ -169,6 +200,11 @@ export async function serveFakeNaukri(
       return html(loggedIn ? '<a href="/mnjuser/profile">Profile</a>' : '<script>location.replace("/nlogin/login")</script>');
     }
     if (pathname.startsWith('/nlogin/')) return html('<input id="usernameField">');
+    if (/-jobs(-in-[\w-]+)?$/.test(pathname)) return html(SEARCH_PAGE);
+    if (/^\/jobapi\/v3\/search$/.test(pathname)) {
+      const cards = typeof search === 'function' ? search() : search;
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ jobDetails: cards.map(searchApiJob) }) });
+    }
     const apiId = pathname.match(/^\/jobapi\/v4\/job\/(\d+)$/)?.[1];
     if (apiId) {
       const external = find(apiId)?.kind === 'external';

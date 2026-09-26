@@ -223,6 +223,11 @@ export const MIGRATIONS = [
   ALTER TABLE applications_rebuilt RENAME TO applications;
   CREATE INDEX applications_job ON applications (job_id);
   CREATE INDEX applications_run ON applications (run_id);`,
+
+  // The job's cities in canonical form ("Remote" for remote jobs), filled in when jobs are sorted
+  // into profiles, so lists can filter by the locations picked on the dashboard.
+  `ALTER TABLE jobs ADD COLUMN cities TEXT NOT NULL DEFAULT '[]';
+  CREATE INDEX jobs_posted ON jobs (posted_at);`,
 ];
 
 // A consistent copy (WAL included) taken before migrating, in data/backups/.

@@ -2,7 +2,8 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { MatchEvidence } from '../ai/schemas.ts';
 import {
   OUTCOMES,
-  freshSince,
+  freshWindow,
+  maxExperience,
   type JobCategory,
   type JobDetail,
   type JobListItem,
@@ -10,25 +11,31 @@ import {
   type JobScope,
   type JobStatus,
 } from '../domain.ts';
+import { expandLocations } from '../jobs/filtering.ts';
 import type { JobCard, JobDetails } from '../jobs/normalization.ts';
 
 // Re-analysis may move a job between SHORTLISTED, REVIEW and SKIPPED; nothing leaves APPLIED.
-// Attempts live in the applications table; a job only changes here once Naukri confirms it applied.
+// Attempts live in the applications table. Naukri's confirmation outranks everything else, so any job
+// can become APPLIED: most are applied to before (or without) an AI match.
 const TRANSITIONS: Record<JobStatus, JobStatus[]> = {
   DISCOVERED: ['ANALYZED', 'SHORTLISTED', 'REVIEW', 'SKIPPED', 'ANALYSIS_FAILED'],
   ANALYZED: ['SHORTLISTED', 'REVIEW', 'SKIPPED'],
   ANALYSIS_FAILED: ['DISCOVERED', 'SHORTLISTED', 'REVIEW', 'SKIPPED'],
-  SHORTLISTED: ['REVIEW', 'SKIPPED', 'APPLICATION_STARTED', 'APPLIED'],
+  SHORTLISTED: ['REVIEW', 'SKIPPED', 'APPLICATION_STARTED'],
   REVIEW: ['SHORTLISTED', 'SKIPPED', 'APPLICATION_STARTED'],
   SKIPPED: ['DISCOVERED', 'SHORTLISTED', 'REVIEW'],
   APPLICATION_STARTED: ['READY_TO_SUBMIT', 'FAILED', 'SKIPPED'],
-  READY_TO_SUBMIT: ['APPLIED', 'FAILED'],
+  READY_TO_SUBMIT: ['FAILED'],
   FAILED: ['APPLICATION_STARTED', 'SKIPPED'],
   APPLIED: [],
 };
 
 export function canTransition(from: JobStatus, to: JobStatus): boolean {
-  return from === to || TRANSITIONS[from].includes(to);
+  return from === to || (to === 'APPLIED' ? true : TRANSITIONS[from].includes(to));
+}
+
+export function jobStatus(db: DatabaseSync, id: number): JobStatus | undefined {
+  return (db.prepare('SELECT status FROM jobs WHERE id = ?').get(id) as { status: JobStatus } | undefined)?.status;
 }
 
 // Jobs that keep failing (expired postings, removed pages) stop being retried after this.
@@ -71,14 +78,29 @@ export function insertJob(db: DatabaseSync, job: JobCard, searchName: string, no
   return result.changes > 0;
 }
 
-// Rows of `jobs j` inside a scope: matching any of the chosen profiles and posted within the
-// freshness window. Jobs without a posting date only show up under "all".
-export const IN_SCOPE = `(:profiles IS NULL OR EXISTS (
+// Rows of `jobs j` inside a scope: relevant to one of the chosen profiles (any profile when none is
+// chosen), in one of the chosen cities (remote jobs and jobs without a location always are), and
+// posted within the window. Jobs without a posting date only show up when there is no window.
+export const IN_SCOPE = `json_array_length(j.profiles) > 0
+  AND (:profiles IS NULL OR EXISTS (
     SELECT 1 FROM json_each(j.profiles) p JOIN json_each(:profiles) chosen ON chosen.value = p.value))
-  AND (:since IS NULL OR julianday(j.posted_at) >= julianday(:since))`;
+  AND (:cities IS NULL OR json_array_length(j.cities) = 0 OR EXISTS (
+    SELECT 1 FROM json_each(j.cities) c WHERE c.value = 'Remote' OR c.value IN (SELECT value FROM json_each(:cities))))
+  AND (:since IS NULL OR julianday(j.posted_at) >= julianday(:since))
+  AND (:until IS NULL OR julianday(j.posted_at) < julianday(:until))`;
 
-export function scopeParams(scope: JobScope, now = new Date()): { profiles: string | null; since: string | null } {
-  return { profiles: scope.profiles.length ? JSON.stringify(scope.profiles) : null, since: freshSince(scope.freshness, now) };
+export function scopeParams(scope: JobScope, now = new Date()): { profiles: string | null; cities: string | null; since: string | null; until: string | null } {
+  const locations = scope.locations ?? [];
+  return {
+    profiles: scope.profiles.length ? JSON.stringify(scope.profiles) : null,
+    cities: locations.length ? JSON.stringify(expandLocations(locations)) : null,
+    ...freshWindow(scope, now),
+  };
+}
+
+// What JOB_CATEGORY needs besides the latest attempt.
+export function categoryParams(scope: JobScope, minMatchScore: number): { outcomes: string; maxExperience: number | null; minMatchScore: number } {
+  return { outcomes: JSON.stringify(OUTCOMES), maxExperience: maxExperience(scope), minMatchScore };
 }
 
 const ALL: JobScope = { profiles: [], freshness: 'all' };
@@ -122,8 +144,8 @@ export function saveJobDetails(db: DatabaseSync, id: number, details: JobDetails
   });
 }
 
-export function setJobProfiles(db: DatabaseSync, id: number, profiles: string[]): void {
-  db.prepare('UPDATE jobs SET profiles = ? WHERE id = ?').run(JSON.stringify(profiles), id);
+export function setJobClassification(db: DatabaseSync, id: number, { profiles, cities }: { profiles: string[]; cities: string[] }): void {
+  db.prepare('UPDATE jobs SET profiles = ?, cities = ? WHERE id = ?').run(JSON.stringify(profiles), JSON.stringify(cities), id);
 }
 
 export function recordDetailFailure(db: DatabaseSync, id: number, now = new Date()): void {
@@ -176,6 +198,18 @@ export function updateJobStatus(
   });
 }
 
+export function setMatchScore(db: DatabaseSync, id: number, score: number, now = new Date()): void {
+  db.prepare('UPDATE jobs SET match_score = ?, updated_at = ? WHERE id = ?').run(score, now.toISOString(), id);
+}
+
+// Only a job not scored yet is marked failed; a failed re-analysis keeps the earlier verdict.
+export function markAnalysisFailed(db: DatabaseSync, id: number, message: string, now = new Date()): void {
+  db.prepare(
+    `UPDATE jobs SET status = 'ANALYSIS_FAILED', match_score = NULL, analysis_error = ?, updated_at = ?
+     WHERE id = ? AND status IN ('DISCOVERED', 'ANALYSIS_FAILED')`,
+  ).run(message, now.toISOString(), id);
+}
+
 export function markJobApplied(db: DatabaseSync, id: number, now = new Date()): void {
   const row = db.prepare('SELECT status FROM jobs WHERE id = ?').get(id) as { status: JobStatus } | undefined;
   if (!row) throw new Error(`Job ${id} does not exist`);
@@ -183,38 +217,56 @@ export function markJobApplied(db: DatabaseSync, id: number, now = new Date()): 
   db.prepare(`UPDATE jobs SET status = 'APPLIED', updated_at = ? WHERE id = ?`).run(now.toISOString(), id);
 }
 
-// The simple status a job shows: its latest attempt's outcome, or, for a job never attempted, how far
-// matching got. Needs the `:outcomes` parameter (JSON of OUTCOMES) and the latest attempt as `ap`.
+const TOO_EXPERIENCED = `(:maxExperience IS NOT NULL AND j.experience_min > :maxExperience + 0.001)`;
+const LOW_MATCH = `(j.match_score IS NOT NULL AND j.match_score < :minMatchScore)`;
+
+// The simple status a job shows: its latest attempt's outcome, or, for a job not attempted (or only
+// checked with auto apply off), whether it can be applied to. A job the AI hasn't scored can be.
+// Needs :outcomes (JSON of OUTCOMES), :maxExperience and :minMatchScore, and the latest attempt as `ap`.
 export const JOB_CATEGORY = `CASE
     WHEN j.status = 'APPLIED' THEN CASE
       WHEN EXISTS (SELECT 1 FROM applications x WHERE x.job_id = j.id AND x.status = 'APPLIED') THEN 'applied'
       ELSE 'already_applied' END
-    WHEN ap.status IS NOT NULL THEN :outcomes ->> ('$.' || ap.status)
-    WHEN j.status = 'SHORTLISTED' AND j.external_apply THEN 'external'
-    WHEN j.status = 'SHORTLISTED' THEN 'ready'
-    WHEN j.status IN ('DISCOVERED', 'ANALYSIS_FAILED') THEN 'new'
-    WHEN j.status = 'SKIPPED' AND j.filter_reason IS NOT NULL THEN 'filtered'
-    ELSE 'low_match'
+    WHEN ap.status IS NOT NULL AND ap.status NOT IN ('READY_TO_APPLY', 'READY_TO_SUBMIT') THEN :outcomes ->> ('$.' || ap.status)
+    WHEN j.external_apply THEN 'external'
+    WHEN ${TOO_EXPERIENCED} OR ${LOW_MATCH} THEN 'not_eligible'
+    ELSE 'ready'
+  END`;
+
+const INELIGIBLE_REASON = `CASE
+    WHEN ${TOO_EXPERIENCED} THEN 'Requires ' || printf('%g', j.experience_min) || '+ years'
+    WHEN ${LOW_MATCH} THEN 'AI match ' || j.match_score || ' is below ' || CAST(:minMatchScore AS INTEGER)
   END`;
 
 const LIST_COLUMNS = `j.id, j.company, j.title, j.location, j.experience, j.posted_at AS postedAt, j.match_score AS score,
-  a.recommendation AS band, j.profiles, j.status AS jobStatus, ap.status AS applicationStatus, ${JOB_CATEGORY} AS category`;
+  a.recommendation AS band, j.profiles, j.status AS jobStatus, ap.status AS applicationStatus, ${JOB_CATEGORY} AS category,
+  ${INELIGIBLE_REASON} AS ineligibleReason`;
 
 const LATEST_JOINS = `LEFT JOIN job_analysis a ON a.id = (SELECT max(id) FROM job_analysis WHERE job_id = j.id)
   LEFT JOIN applications ap ON ap.id = (SELECT max(id) FROM applications WHERE job_id = j.id)`;
 
-const toListItem = (row: Record<string, unknown>): JobListItem => ({ ...(row as unknown as JobListItem), profiles: JSON.parse(row.profiles as string) });
+function toListItem(row: Record<string, unknown>): JobListItem {
+  const job = { ...(row as unknown as JobListItem), profiles: JSON.parse(row.profiles as string) as string[] };
+  if (job.category !== 'not_eligible') job.ineligibleReason = null;
+  return job;
+}
 
-// Jobs still to act on come first, then the rest; freshest first within each.
+export interface Eligibility {
+  scope: JobScope;
+  minMatchScore: number;
+}
+
+// Freshest first.
 export function listJobs(
   db: DatabaseSync,
   {
     scope = ALL,
+    minMatchScore = 0,
     category = 'all',
     limit = 100,
     offset = 0,
     now = new Date(),
-  }: { scope?: JobScope; category?: JobCategory | 'all'; limit?: number; offset?: number; now?: Date } = {},
+  }: { scope?: JobScope; minMatchScore?: number; category?: JobCategory | 'all'; limit?: number; offset?: number; now?: Date } = {},
 ): JobPage {
   const rows = db
     .prepare(
@@ -222,18 +274,17 @@ export function listJobs(
          SELECT ${LIST_COLUMNS}, j.discovered_at AS discoveredAt FROM jobs j ${LATEST_JOINS} WHERE ${IN_SCOPE}
        )
        WHERE :category = 'all' OR category = :category
-       ORDER BY CASE category WHEN 'applying' THEN 0 WHEN 'ready' THEN 1 WHEN 'new' THEN 2 ELSE 3 END,
-                julianday(postedAt) DESC NULLS LAST, discoveredAt DESC, id DESC
+       ORDER BY julianday(postedAt) DESC NULLS LAST, discoveredAt DESC, id DESC
        LIMIT :limit OFFSET :offset`,
     )
-    .all({ outcomes: JSON.stringify(OUTCOMES), category, limit, offset, ...scopeParams(scope, now) }) as Record<string, unknown>[];
+    .all({ ...categoryParams(scope, minMatchScore), category, limit, offset, ...scopeParams(scope, now) }) as Record<string, unknown>[];
   return {
     jobs: rows.map(({ total: _, discoveredAt: __, ...job }) => toListItem(job)),
     total: (rows[0]?.total as number | undefined) ?? 0,
   };
 }
 
-export function getJobDetail(db: DatabaseSync, id: number): Omit<JobDetail, 'applications'> | undefined {
+export function getJobDetail(db: DatabaseSync, id: number, { scope = ALL, minMatchScore = 0 }: Partial<Eligibility> = {}): Omit<JobDetail, 'applications'> | undefined {
   const row = db
     .prepare(
       `SELECT ${LIST_COLUMNS}, j.url, j.salary, j.work_mode AS workMode, j.skills, j.description,
@@ -243,7 +294,7 @@ export function getJobDetail(db: DatabaseSync, id: number): Omit<JobDetail, 'app
               a.missing_skills AS missingSkills, a.red_flags AS redFlags, a.breakdown, a.score AS analysisScore
        FROM jobs j ${LATEST_JOINS} WHERE j.id = :id`,
     )
-    .get({ id, outcomes: JSON.stringify(OUTCOMES) }) as Record<string, unknown> | undefined;
+    .get({ id, ...categoryParams(scope, minMatchScore) }) as Record<string, unknown> | undefined;
   if (!row) return undefined;
 
   const { provider, model, analyzedAt, evidence, reason, matchedSkills, missingSkills, redFlags, breakdown, analysisScore, ...job } = row;
@@ -275,6 +326,7 @@ export function getJobDetail(db: DatabaseSync, id: number): Omit<JobDetail, 'app
     profiles: JSON.parse(job.profiles as string),
     skills: JSON.parse(job.skills as string),
     externalApply: job.externalApply === null ? null : Boolean(job.externalApply),
+    ineligibleReason: job.category === 'not_eligible' ? (job.ineligibleReason as string) : null,
     analysis,
   };
 }
@@ -292,28 +344,49 @@ export interface JobRow {
   status: JobStatus;
   filterReason: string | null;
   profiles: string[];
+  cities: string[];
 }
 
 const JOB_COLUMNS = `j.id, j.title, j.company, j.location, j.work_mode AS workMode, j.experience, j.salary, j.skills,
-  j.description, j.status, j.filter_reason AS filterReason, j.profiles`;
+  j.description, j.status, j.filter_reason AS filterReason, j.profiles, j.cities`;
 
 function toJobRow(row: Record<string, unknown>): JobRow {
-  return { ...(row as unknown as JobRow), skills: JSON.parse(row.skills as string), profiles: JSON.parse(row.profiles as string) };
+  return {
+    ...(row as unknown as JobRow),
+    skills: JSON.parse(row.skills as string),
+    profiles: JSON.parse(row.profiles as string),
+    cities: JSON.parse(row.cities as string),
+  };
 }
 
 export type ClassifiableJob = Omit<JobRow, 'description' | 'experience' | 'salary'>;
 
-// Every job without its description, for matching against the job profiles: cheap enough to redo
+// Every job without its description, for sorting into job profiles and cities: cheap enough to redo
 // whenever the profiles change.
 export function allJobs(db: DatabaseSync): ClassifiableJob[] {
   return db
     .prepare(
       `SELECT j.id, j.title, j.company, j.location, j.work_mode AS workMode, j.skills, j.status,
-              j.filter_reason AS filterReason, j.profiles
+              j.filter_reason AS filterReason, j.profiles, j.cities
        FROM jobs j ORDER BY j.id`,
     )
     .all()
-    .map((row) => ({ ...(row as unknown as ClassifiableJob), skills: JSON.parse(row.skills as string), profiles: JSON.parse(row.profiles as string) }));
+    .map((row) => toJobRow(row as Record<string, unknown>));
+}
+
+// The next job worth an AI match while a run is on: in scope, eligible on experience, applied on
+// Naukri itself, with a description and never scored. Jobs not attempted yet come first.
+export function nextJobToMatch(db: DatabaseSync, scope: JobScope, now = new Date()): JobRow | undefined {
+  const row = db
+    .prepare(
+      `SELECT ${JOB_COLUMNS} FROM jobs j
+       WHERE j.status = 'DISCOVERED' AND j.description IS NOT NULL AND NOT coalesce(j.external_apply, 0)
+         AND NOT ${TOO_EXPERIENCED} AND ${IN_SCOPE}
+       ORDER BY EXISTS (SELECT 1 FROM applications x WHERE x.job_id = j.id), julianday(j.posted_at) DESC NULLS LAST, j.id
+       LIMIT 1`,
+    )
+    .get({ ...scopeParams(scope, now), maxExperience: maxExperience(scope) }) as Record<string, unknown> | undefined;
+  return row && toJobRow(row);
 }
 
 // Jobs with a description that still need scoring, freshest first; with `force`, earlier verdicts and

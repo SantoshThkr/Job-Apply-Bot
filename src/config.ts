@@ -1,17 +1,28 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, extname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import type { SavedAnswer, UserProfile } from './domain.ts';
 
 export const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 export const paths = {
   config: join(ROOT, 'config'),
+  // Everything personal: profile, answers, resume, browser session, database. Git-ignored.
+  data: join(ROOT, 'data'),
   browserProfile: join(ROOT, 'data', 'browser-profile'),
   database: join(ROOT, 'data', 'jobs.db'),
   debug: join(ROOT, 'data', 'debug'),
   logs: join(ROOT, 'logs'),
 };
+
+// Job profiles live in `config`; the user's own files in `data`.
+export interface Dirs {
+  config: string;
+  data: string;
+}
+
+export const DEFAULT_DIRS: Dirs = { config: paths.config, data: paths.data };
 
 export class ConfigError extends Error {
   name = 'ConfigError';
@@ -72,43 +83,68 @@ export function loadEnv(source: Record<string, string | undefined> = process.env
 
 const text = z.string().trim().min(1);
 const textList = z.array(text);
+const optionalText = z.string().trim().default('');
+
+const aliasesAreOwnSkills = (skills: string[], aliases: Record<string, string[]>) => {
+  const own = new Set(skills.map((s) => s.toLowerCase()));
+  return Object.keys(aliases).every((skill) => own.has(skill.toLowerCase()));
+};
 
 // Strict objects so a misspelled key fails loudly instead of silently falling back to a default.
-export const profileSchema = z
+export const userProfileSchema = z
+  .strictObject({
+    firstName: text,
+    lastName: optionalText,
+    email: optionalText,
+    phone: optionalText,
+    location: optionalText,
+    preferredLocations: textList.default([]),
+    experienceYears: z.number().min(0).max(60),
+    experienceToleranceMonths: z.number().int().min(0).max(60).default(6),
+    currentRole: optionalText,
+    currentCompany: optionalText,
+    noticePeriodDays: z.number().int().min(0).max(365).nullable().default(null),
+    currentSalary: optionalText,
+    expectedSalary: optionalText,
+    skills: textList.min(1, 'Add at least one skill'),
+    otherSkills: textList.default([]),
+    // Built-in aliases (LLM = Large Language Models, ...) live in src/jobs/skills.ts.
+    skillAliases: z.record(text, textList).default({}),
+    resumeFile: z.string().trim().regex(/^[^/\\]+$/, 'a file name in data/resume').nullable().default(null),
+  })
+  .refine((p) => aliasesAreOwnSkills([...p.skills, ...p.otherSkills], p.skillAliases), {
+    message: 'Every skillAliases key must be one of your skills',
+    path: ['skillAliases'],
+  }) satisfies z.ZodType<UserProfile, unknown>;
+
+// config/profile.json and config/resume.json from before the dashboard's Profile page. Still read
+// when data/user-profile.json doesn't exist yet.
+const legacyProfileSchema = z
   .strictObject({
     name: text,
-    // Used to fill application forms. Experience never filters or ranks jobs.
     experienceYears: z.number().min(0).max(60),
     primarySkills: textList.min(1),
     secondarySkills: textList.default([]),
     preferredLocations: textList.min(1),
-    // Extra names that count as one of your skills, e.g. { "Node.js": ["Express"] }. Built-in aliases
-    // (LLM = Large Language Models, ...) live in src/jobs/skills.ts.
     skillAliases: z.record(text, textList).default({}),
-    // No longer used: target roles now come from job profiles, and experience filters nothing.
-    // Accepted so older profile.json files still load.
     targetRoles: textList.optional(),
     minimumExperience: z.number().optional(),
     maximumExperience: z.number().optional(),
   })
-  .refine(
-    (profile) => {
-      const own = new Set([...profile.primarySkills, ...profile.secondarySkills].map((s) => s.toLowerCase()));
-      return Object.keys(profile.skillAliases).every((skill) => own.has(skill.toLowerCase()));
-    },
-    { message: 'Every skillAliases key must be one of your primarySkills or secondarySkills', path: ['skillAliases'] },
-  );
+  .refine((p) => aliasesAreOwnSkills([...p.primarySkills, ...p.secondarySkills], p.skillAliases), {
+    message: 'Every skillAliases key must be one of your primarySkills or secondarySkills',
+    path: ['skillAliases'],
+  });
 
-// Details application forms ask for. Only config/answers.json and this file ever fill a form.
-export const resumeSchema = z.strictObject({
+const legacyResumeSchema = z.strictObject({
   resumePath: text,
   resumeName: text.optional(),
   email: text.optional(),
   phone: text.optional(),
   currentTitle: text,
-  currentLocation: z.string().trim().default(''),
+  currentLocation: optionalText,
   noticePeriodDays: z.number().int().min(0).max(365),
-  expectedSalary: z.string().trim().default(''),
+  expectedSalary: optionalText,
   education: textList.default([]),
   preferredWorkMode: z.array(z.enum(['Remote', 'Hybrid', 'Office'])).default([]),
 });
@@ -140,10 +176,19 @@ export const answersSchema = z.array(
   }),
 );
 
-export type Profile = z.infer<typeof profileSchema>;
-export type Resume = z.infer<typeof resumeSchema>;
 export type JobProfile = z.infer<typeof jobProfilesSchema>[number];
-export type Answer = z.infer<typeof answersSchema>[number];
+export type Answer = SavedAnswer;
+
+// What matching needs to know about the candidate. The split into primary and secondary skills and
+// the locations are part of the AI cache key, so they keep the shape older profiles had.
+export interface Profile {
+  name: string;
+  experienceYears: number;
+  primarySkills: string[];
+  secondarySkills: string[];
+  preferredLocations: string[];
+  skillAliases: Record<string, string[]>;
+}
 
 // Paths of values still holding YOUR_* template text, so they never reach an application form.
 function findPlaceholders(value: unknown, path = ''): string[] {
@@ -155,35 +200,142 @@ function findPlaceholders(value: unknown, path = ''): string[] {
   return [];
 }
 
+// "data/user-profile.json" for files in the project, the full path for anything else.
+function shown(file: string): string {
+  const inProject = relative(ROOT, file);
+  return inProject && !inProject.startsWith('..') ? inProject : file;
+}
+
 function readConfig<T extends z.ZodType>(dir: string, file: string, schema: T): z.infer<T> {
-  const example = file.replace(/\.json$/, '.example.json');
+  const path = join(dir, file);
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(join(dir, file), 'utf8'));
+    raw = JSON.parse(readFileSync(path, 'utf8'));
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      throw new ConfigError(`config/${file} not found. Copy config/${example} to config/${file} and fill in your details.`);
-    }
-    throw new ConfigError(`Cannot read config/${file}: ${(err as Error).message}`);
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') throw new ConfigError(`${shown(path)} not found`);
+    throw new ConfigError(`Cannot read ${shown(path)}: ${(err as Error).message}`);
   }
 
   const placeholders = findPlaceholders(raw);
   if (placeholders.length) {
-    throw new ConfigError(`config/${file} still has template values at: ${placeholders.join(', ')}. Replace them with your own.`);
+    throw new ConfigError(`${shown(path)} still has template values at: ${placeholders.join(', ')}. Replace them with your own.`);
   }
 
   const result = schema.safeParse(raw);
-  if (!result.success) throw new ConfigError(`Invalid config/${file}:\n${z.prettifyError(result.error)}`);
+  if (!result.success) throw new ConfigError(`Invalid ${shown(path)}:\n${z.prettifyError(result.error)}`);
   return result.data;
 }
 
-export function loadProfile(dir = paths.config): Profile {
-  return readConfig(dir, 'profile.json', profileSchema);
+// Written whole to a temporary file first, so a crash never leaves half a profile behind.
+function writeJson(dir: string, file: string, value: unknown): void {
+  mkdirSync(dir, { recursive: true });
+  const target = join(dir, file);
+  writeFileSync(`${target}.tmp`, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  renameSync(`${target}.tmp`, target);
 }
 
-export function loadResume(dir = paths.config): Resume {
-  const resume = readConfig(dir, 'resume.json', resumeSchema);
-  return { ...resume, resumePath: resolve(ROOT, resume.resumePath) };
+export interface LoadedProfile {
+  profile: UserProfile;
+  source: 'data' | 'legacy';
+  resumePath: string | null;
+}
+
+function legacyProfile(configDir: string): LoadedProfile {
+  const old = readConfig(configDir, 'profile.json', legacyProfileSchema);
+  const resume = existsSync(join(configDir, 'resume.json')) ? readConfig(configDir, 'resume.json', legacyResumeSchema) : null;
+  const [firstName = old.name, ...rest] = old.name.split(/\s+/);
+  return {
+    source: 'legacy',
+    resumePath: resume ? resolve(ROOT, resume.resumePath) : null,
+    profile: {
+      firstName,
+      lastName: rest.join(' '),
+      email: resume?.email ?? '',
+      phone: resume?.phone ?? '',
+      location: resume?.currentLocation ?? '',
+      preferredLocations: old.preferredLocations,
+      experienceYears: old.experienceYears,
+      experienceToleranceMonths: 6,
+      currentRole: resume?.currentTitle ?? '',
+      currentCompany: '',
+      noticePeriodDays: resume?.noticePeriodDays ?? null,
+      currentSalary: '',
+      expectedSalary: resume?.expectedSalary ?? '',
+      skills: old.primarySkills,
+      otherSkills: old.secondarySkills,
+      skillAliases: old.skillAliases,
+      resumeFile: null,
+    },
+  };
+}
+
+const resumeDir = (dirs: Dirs) => join(dirs.data, 'resume');
+
+// data/user-profile.json, or the older config/profile.json; null when there is neither yet.
+export function loadUserProfile(dirs: Dirs = DEFAULT_DIRS): LoadedProfile | null {
+  if (existsSync(join(dirs.data, 'user-profile.json'))) {
+    const profile = readConfig(dirs.data, 'user-profile.json', userProfileSchema);
+    return { profile, source: 'data', resumePath: profile.resumeFile ? join(resumeDir(dirs), profile.resumeFile) : null };
+  }
+  return existsSync(join(dirs.config, 'profile.json')) ? legacyProfile(dirs.config) : null;
+}
+
+export function requireUserProfile(dirs: Dirs = DEFAULT_DIRS): LoadedProfile {
+  const loaded = loadUserProfile(dirs);
+  if (!loaded) throw new ConfigError('Set up your profile first: open the dashboard and fill in the Profile page.');
+  return loaded;
+}
+
+// Saves the Profile page. A resume the older config pointed at is copied into data/resume/ the first time.
+export function saveUserProfile(input: unknown, dirs: Dirs = DEFAULT_DIRS): UserProfile {
+  const result = userProfileSchema.safeParse(input);
+  if (!result.success) throw new ConfigError(z.prettifyError(result.error));
+  const profile = result.data;
+  const current = loadUserProfile(dirs);
+  if (!profile.resumeFile && current?.source === 'legacy' && current.resumePath && existsSync(current.resumePath)) {
+    mkdirSync(resumeDir(dirs), { recursive: true });
+    profile.resumeFile = basename(current.resumePath);
+    copyFileSync(current.resumePath, join(resumeDir(dirs), profile.resumeFile));
+  }
+  if (profile.resumeFile && !existsSync(join(resumeDir(dirs), profile.resumeFile))) profile.resumeFile = null;
+  writeJson(dirs.data, 'user-profile.json', profile);
+  return profile;
+}
+
+const RESUME_TYPES = new Set(['.pdf', '.doc', '.docx']);
+export const MAX_RESUME_BYTES = 5 * 1024 * 1024;
+
+// Stores an uploaded resume in data/resume/, replacing the previous one, and returns its file name.
+export function saveResume(name: string, data: Buffer, dirs: Dirs = DEFAULT_DIRS): string {
+  const file = basename(name).replace(/[^\w.() -]+/g, '_').trim();
+  if (!RESUME_TYPES.has(extname(file).toLowerCase())) throw new ConfigError('The resume must be a PDF or Word file (.pdf, .doc, .docx)');
+  if (!data.length) throw new ConfigError('The resume file is empty');
+  if (data.length > MAX_RESUME_BYTES) throw new ConfigError('The resume must be 5 MB or smaller');
+  const dir = resumeDir(dirs);
+  mkdirSync(dir, { recursive: true });
+  for (const old of readdirSync(dir)) if (old !== file) unlinkSync(join(dir, old));
+  writeFileSync(join(dir, file), data, { mode: 0o600 });
+  return file;
+}
+
+export function resumeInfo(path: string | null): { name: string; size: number } | null {
+  return path && existsSync(path) ? { name: basename(path), size: statSync(path).size } : null;
+}
+
+// The matching view of the profile.
+export function matchProfile(user: UserProfile): Profile {
+  return {
+    name: [user.firstName, user.lastName].filter(Boolean).join(' '),
+    experienceYears: user.experienceYears,
+    primarySkills: user.skills,
+    secondarySkills: user.otherSkills,
+    preferredLocations: user.preferredLocations.length ? user.preferredLocations : [user.location].filter(Boolean),
+    skillAliases: user.skillAliases,
+  };
+}
+
+export function loadProfile(dirs: Dirs = DEFAULT_DIRS): Profile {
+  return matchProfile(requireUserProfile(dirs).profile);
 }
 
 // config/job-profiles.json when you have one, otherwise the defaults in job-profiles.example.json.
@@ -192,6 +344,17 @@ export function loadJobProfiles(dir = paths.config): JobProfile[] {
   return readConfig(dir, file, jobProfilesSchema);
 }
 
-export function loadAnswers(dir = paths.config): Answer[] {
-  return readConfig(dir, 'answers.json', answersSchema);
+// data/answers.json, or the older config/answers.json; none yet is an empty list.
+export function loadAnswers(dirs: Dirs = DEFAULT_DIRS): Answer[] {
+  for (const dir of [dirs.data, dirs.config]) {
+    if (existsSync(join(dir, 'answers.json'))) return readConfig(dir, 'answers.json', answersSchema);
+  }
+  return [];
+}
+
+export function saveAnswers(input: unknown, dirs: Dirs = DEFAULT_DIRS): Answer[] {
+  const result = answersSchema.safeParse(input);
+  if (!result.success) throw new ConfigError(z.prettifyError(result.error));
+  writeJson(dirs.data, 'answers.json', result.data);
+  return result.data;
 }

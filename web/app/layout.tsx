@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import type { ReactNode } from 'react';
 import { Header } from '@/components/header';
 import { LiveProvider } from '@/lib/live';
-import { ScopeProvider } from '@/lib/scope';
+import { SettingsProvider } from '@/lib/scope';
 import './globals.css';
 
 export const metadata: Metadata = {
@@ -15,10 +15,10 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     <html lang="en">
       <body className="min-h-screen font-sans antialiased">
         <LiveProvider>
-          <ScopeProvider>
+          <SettingsProvider>
             <Header />
             <main className="mx-auto max-w-6xl px-4 py-4">{children}</main>
-          </ScopeProvider>
+          </SettingsProvider>
         </LiveProvider>
       </body>
     </html>

@@ -28,33 +28,37 @@ function Step({ event }: { event: RunEvent }) {
   );
 }
 
-// What the bot is doing right now: the job it is on and every step so far, or that nothing is running.
+// What the bot is doing right now: searching, sorting, or the job it is applying to with every step so far.
 export function CurrentRun() {
-  const { run, state, analysis, log } = useLive();
+  const { run, state, log, search } = useLive();
   const active = state?.activeRun;
-  if (!active) return <p className="text-sm text-slate-500">No active application run.</p>;
+  if (!active) return <p className="text-sm text-slate-500">No run is active.</p>;
 
-  if (active.kind !== 'APPLY') {
-    const lastLine = log.findLast((line) => line.runId === active.id)?.message;
-    return (
-      <p className="text-sm" aria-live="polite">
-        {analysis && analysis.runId === active.id
-          ? `Matching ${analysis.done} / ${analysis.total}: ${analysis.jobTitle} · ${analysis.company}`
-          : (lastLine ?? 'Searching Naukri…')}
-      </p>
-    );
-  }
-
-  const start = run.findLast((e) => e.type === 'JOB_STARTED');
   const notice = active.stopRequested
     ? 'Stopping after the current step…'
     : active.paused
       ? 'Paused. Nothing is clicked until you resume.'
       : null;
+  const searched = run.findLast((e) => e.type === 'SEARCH_FINISHED');
+  const queued = run.findLast((e) => e.type === 'QUEUE_READY');
+  const start = run.findLast((e) => e.type === 'JOB_STARTED');
+
   if (!start) {
+    const lastLine = log.findLast((line) => line.runId === active.id)?.message;
     return (
-      <div className="space-y-1 text-sm">
-        <p>Checking the Naukri session and building the queue…</p>
+      <div className="space-y-1 text-sm" aria-live="polite">
+        {queued ? (
+          <p className="font-medium">{queued.message}. Applying automatically…</p>
+        ) : searched ? (
+          <p className="font-medium">{searched.message}. Filtering…</p>
+        ) : (
+          <>
+            <p className="font-medium">
+              Searching Naukri…{search?.runId === active.id && ` ${search.found} jobs found, ${search.added} new`}
+            </p>
+            {lastLine && <p className="text-slate-600">{lastLine}</p>}
+          </>
+        )}
         {notice && <p className="text-amber-800">{notice}</p>}
       </div>
     );
@@ -62,7 +66,7 @@ export function CurrentRun() {
 
   const steps = run.filter((e) => e.applicationId === start.applicationId && e.type !== 'JOB_STARTED');
   const final = steps.find((e) => e.status);
-  const { position, total } = start.detail ?? {};
+  const { position, total, nextCompany, nextTitle } = start.detail ?? {};
   return (
     <div className="space-y-3">
       <p className="text-2xl font-semibold tabular-nums" aria-live="polite">
@@ -79,17 +83,22 @@ export function CurrentRun() {
       </ol>
       {final?.status ? (
         <p className="flex items-center gap-2 text-sm font-semibold">
-          Status <StatusBadge status={final.status} />
+          <StatusBadge status={final.status} />
         </p>
       ) : (
-        <p className="text-sm text-sky-700">Working…</p>
+        <p className="text-sm text-sky-700">Applying…</p>
+      )}
+      {nextCompany && (
+        <p className="text-xs text-slate-500">
+          Next: {String(nextCompany)} · {String(nextTitle)}
+        </p>
       )}
       {notice && <p className="text-sm text-amber-800">{notice}</p>}
     </div>
   );
 }
 
-// Pause, Resume and Stop for whatever run is active; nothing when idle.
+// Pause, Resume and Stop for the active run; nothing when idle.
 export function RunControls() {
   const { state } = useLive();
   const [error, setError] = useState<string | null>(null);
@@ -99,16 +108,15 @@ export function RunControls() {
 
   return (
     <div className="flex flex-wrap items-center gap-2">
-      {run.kind === 'APPLY' &&
-        (run.paused ? (
-          <Button onClick={() => send('resume')} disabled={run.stopRequested}>
-            Resume
-          </Button>
-        ) : (
-          <Button onClick={() => send('pause')} disabled={run.stopRequested}>
-            Pause
-          </Button>
-        ))}
+      {run.paused ? (
+        <Button onClick={() => send('resume')} disabled={run.stopRequested}>
+          Resume
+        </Button>
+      ) : (
+        <Button onClick={() => send('pause')} disabled={run.stopRequested}>
+          Pause
+        </Button>
+      )}
       <Button variant="danger" onClick={() => send('stop')} disabled={run.stopRequested}>
         {run.stopRequested ? 'Stopping…' : 'Stop'}
       </Button>

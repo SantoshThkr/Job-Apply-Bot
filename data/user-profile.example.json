@@ -1,0 +1,19 @@
+{
+  "firstName": "YOUR_FIRST_NAME",
+  "lastName": "YOUR_LAST_NAME",
+  "email": "YOUR_EMAIL",
+  "phone": "YOUR_PHONE",
+  "location": "YOUR_CITY",
+  "preferredLocations": ["Remote", "YOUR_CITY"],
+  "experienceYears": 5,
+  "experienceToleranceMonths": 6,
+  "currentRole": "YOUR_CURRENT_ROLE",
+  "currentCompany": "YOUR_CURRENT_COMPANY",
+  "noticePeriodDays": 30,
+  "currentSalary": "",
+  "expectedSalary": "",
+  "skills": ["React", "TypeScript", "JavaScript"],
+  "otherSkills": ["Node.js"],
+  "skillAliases": {},
+  "resumeFile": null
+}

@@ -1,35 +1,28 @@
 'use client';
 
-import type { JobCategory, JobPage } from '@bot/domain';
+import { CATEGORY_LABELS, type JobCategory, type JobPage } from '@bot/domain';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 import { useApi } from '@/lib/api';
 import { posted } from '@/lib/format';
 import { useLive } from '@/lib/live';
-import { scopeQuery, useScope } from '@/lib/scope';
+import { scopeQuery, useSettings } from '@/lib/scope';
 import { Button, ErrorText, StatusBadge } from './ui';
 
-const STATUS_FILTERS: [JobCategory | 'all', string][] = [
-  ['all', 'All'],
-  ['ready', 'Ready to apply'],
-  ['applied', 'Applied'],
-  ['failed', 'Failed'],
-  ['external', 'External'],
-  ['review', 'Review'],
-  ['new', 'New (no match yet)'],
-];
+const STATUS_FILTERS: [JobCategory | 'all', string][] = [['all', 'All'], ...(Object.entries(CATEGORY_LABELS) as [JobCategory, string][])];
 const PAGE_SIZE = 100;
 
 export function JobsTable() {
   const router = useRouter();
   const { version } = useLive();
-  const { scope } = useScope();
+  const { settings } = useSettings();
   const [status, setStatus] = useState<JobCategory | 'all'>('all');
   const [page, setPage] = useState(0);
+  const scope = scopeQuery(settings);
   useEffect(() => setPage(0), [scope, status]);
 
-  const query = `${scopeQuery(scope)}&status=${status}&limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`;
+  const query = `${scope}&status=${status}&limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`;
   const { data, error } = useApi<JobPage>(`/api/jobs?${query}`, version);
   const pages = data ? Math.max(1, Math.ceil(data.total / PAGE_SIZE)) : 1;
 
@@ -51,12 +44,13 @@ export function JobsTable() {
       <ErrorText>{error}</ErrorText>
       <div className="overflow-x-auto">
         <table className="w-full text-left text-sm">
-          <caption className="sr-only">Jobs, the ones still to act on first, newest first</caption>
+          <caption className="sr-only">Jobs, newest first</caption>
           <thead className="border-b border-slate-200 text-xs text-slate-500">
             <tr>
               <th scope="col" className="py-2 pr-3 font-medium">Company</th>
               <th scope="col" className="py-2 pr-3 font-medium">Job</th>
               <th scope="col" className="py-2 pr-3 font-medium">Location</th>
+              <th scope="col" className="py-2 pr-3 font-medium">Experience</th>
               <th scope="col" className="py-2 pr-3 font-medium">Posted</th>
               <th scope="col" className="py-2 pr-3 text-right font-medium">Match</th>
               <th scope="col" className="py-2 font-medium">Status</th>
@@ -74,16 +68,18 @@ export function JobsTable() {
                 <td className="max-w-48 truncate py-1.5 pr-3 text-slate-600" title={job.location ?? undefined}>
                   {job.location ?? '-'}
                 </td>
+                <td className="whitespace-nowrap py-1.5 pr-3 text-slate-600">{job.experience ?? '-'}</td>
                 <td className="whitespace-nowrap py-1.5 pr-3 text-slate-600">{posted(job.postedAt)}</td>
                 <td className="py-1.5 pr-3 text-right tabular-nums">{job.score ?? '-'}</td>
                 <td className="py-1.5">
                   <StatusBadge status={job.category} />
+                  {job.ineligibleReason && <p className="mt-0.5 text-xs text-slate-500">{job.ineligibleReason}</p>}
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
-        {data && !data.jobs.length && <p className="py-6 text-center text-sm text-slate-500">No jobs here yet. Search Naukri above.</p>}
+        {data && !data.jobs.length && <p className="py-6 text-center text-sm text-slate-500">No jobs here yet. Start a run on the Apply page to search Naukri.</p>}
       </div>
       {pages > 1 && (
         <div className="flex items-center justify-end gap-2 text-sm text-slate-600">

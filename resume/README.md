@@ -1,5 +1,5 @@
 # Resume
 
-Put your resume PDF in this folder and point `resumePath` in `config/resume.json` at it, for example `./resume/YOUR_RESUME.pdf`.
+Upload your resume on the dashboard's Profile page. It is stored in `data/resume/`, which is git-ignored, so it stays on your machine.
 
-Everything in this folder except this README is git-ignored, so the resume stays on your machine.
+Older setups kept it in this folder; everything here except this README is git-ignored too.

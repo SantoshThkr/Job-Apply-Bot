@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,18 +6,19 @@ import type { BrowserContext, Page } from 'playwright';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { firstPage, launchBrowser } from '../src/browser/browser.ts';
 import { disableManualPauses } from '../src/browser/session.ts';
-import type { Answer } from '../src/config.ts';
+import { loadEnv, paths, type Answer } from '../src/config.ts';
 import { applicationQueue, listApplications } from '../src/db/applications.ts';
 import { openDatabase } from '../src/db/database.ts';
-import { insertJob, setJobProfiles, updateJobStatus } from '../src/db/jobs.ts';
+import { insertJob, listJobs, setJobClassification, updateJobStatus } from '../src/db/jobs.ts';
 import { runEvents } from '../src/db/runs.ts';
 import type { ApplySettings, BotEvent } from '../src/domain.ts';
 import { events } from '../src/events.ts';
 import type { ApplicantFacts } from '../src/jobs/answers.ts';
 import { applyToJobs, isAnsweredBy, type ApplyContext } from '../src/jobs/applying.ts';
+import { jobCities } from '../src/jobs/filtering.ts';
 import { normalizeCard } from '../src/jobs/normalization.ts';
 import { runApplications } from '../src/jobs/runs.ts';
-import { jobUrl, serveFakeNaukri, type FakeJob, type FakeNaukri } from './naukri-fake.ts';
+import { jobUrl, serveFakeNaukri, type FakeCard, type FakeJob, type FakeNaukri } from './naukri-fake.ts';
 
 const channel = process.env.BROWSER_CHANNEL === 'chromium' ? 'chromium' : 'chrome';
 const settings: ApplySettings = {
@@ -28,8 +29,10 @@ const settings: ApplySettings = {
   autoFill: true,
   delaySeconds: 0,
   debugScreenshots: false,
+  search: false,
   limit: null,
 };
+const env = loadEnv({ DELAY_MIN_MS: '0', DELAY_MAX_MS: '0' });
 const answers: Answer[] = [
   { match: ['relocate'], answer: 'Yes' },
   { match: ['notice period'], answer: '30 days' },
@@ -41,20 +44,26 @@ let context: BrowserContext;
 let page: Page;
 let profileDir: string;
 let configDir: string;
+let dataDir: string;
 
 beforeAll(async () => {
   disableManualPauses();
   profileDir = mkdtempSync(join(tmpdir(), 'naukri-bot-apply-'));
-  // An empty config folder: runs must work without answers.json or resume.json.
+  // The shipped job profiles, and a profile with no saved answers or resume: runs must work without them.
   configDir = mkdtempSync(join(tmpdir(), 'naukri-bot-config-'));
+  copyFileSync(join(paths.config, 'job-profiles.example.json'), join(configDir, 'job-profiles.example.json'));
+  dataDir = mkdtempSync(join(tmpdir(), 'naukri-bot-data-'));
+  writeFileSync(
+    join(dataDir, 'user-profile.json'),
+    JSON.stringify({ firstName: 'Test', lastName: 'Candidate', email: 'candidate@example.com', experienceYears: 7, skills: ['React'], preferredLocations: ['Bangalore'] }),
+  );
   context = await launchBrowser({ headless: true, channel, profileDir });
   page = await firstPage(context);
 });
 
 afterAll(async () => {
   await context.close();
-  rmSync(profileDir, { recursive: true, force: true });
-  rmSync(configDir, { recursive: true, force: true });
+  for (const dir of [profileDir, configDir, dataDir]) rmSync(dir, { recursive: true, force: true });
 });
 
 let db: DatabaseSync;
@@ -64,23 +73,25 @@ beforeEach(() => {
 
 const HOUR = 3_600_000;
 
-// A shortlisted job, as analysis would leave it.
+// A job as a search and the AI would leave it: sorted into a profile and scored.
 function addJob(id: string, score: number, company = `Company ${id}`, { hoursAgo = 1, profiles = ['react'] } = {}): number {
   const card = normalizeCard({
     externalId: id,
     url: jobUrl(id),
-    title: 'Test Role',
+    title: profiles.includes('angular') ? 'Angular Developer' : 'React Developer',
     company,
     location: 'Bengaluru',
     experience: '5-9 Yrs',
     posted: Date.now() - hoursAgo * HOUR,
-  });
-  insertJob(db, card!, 'test');
+  })!;
+  insertJob(db, card, 'test');
   const { id: jobId } = db.prepare('SELECT id FROM jobs WHERE external_id = ?').get(id) as { id: number };
-  updateJobStatus(db, jobId, 'SHORTLISTED', { matchScore: score, filterReason: null });
-  setJobProfiles(db, jobId, profiles);
+  updateJobStatus(db, jobId, score >= 75 ? 'SHORTLISTED' : 'SKIPPED', { matchScore: score, filterReason: null });
+  setJobClassification(db, jobId, { profiles, cities: jobCities(card) });
   return jobId;
 }
+
+const queueFor = (s: ApplySettings) => applicationQueue(db, { scope: s, minMatchScore: s.minMatchScore, isAnswered: isAnsweredBy(answers, facts) }).jobs;
 
 function createRunRow(id = 'RUN-TEST'): string {
   db.prepare(`INSERT INTO runs (id, kind, started_at) VALUES (?, 'APPLY', '2026-09-25T10:00:00Z')`).run(id);
@@ -102,7 +113,8 @@ const context_ = (overrides: Partial<ApplyContext> = {}): ApplyContext => ({
 
 async function applyAll(jobs: FakeJob[], overrides: Partial<ApplySettings> = {}, runId = createRunRow()): Promise<FakeNaukri> {
   const fake = await serveFakeNaukri(context, jobs);
-  await applyToJobs(context_({ runId, settings: { ...settings, ...overrides } }), {});
+  const merged = { ...settings, ...overrides };
+  await applyToJobs(context_({ runId, settings: merged }), queueFor(merged), {});
   return fake;
 }
 
@@ -244,7 +256,7 @@ describe('applying to Naukri jobs (fake pages)', () => {
     };
     events.on('event', stopWhenReady);
     try {
-      await applyToJobs(context_({ runId: createRunRow(), signal: abort.signal }), {});
+      await applyToJobs(context_({ runId: createRunRow(), signal: abort.signal }), queueFor(settings), {});
     } finally {
       events.off('event', stopWhenReady);
     }
@@ -306,9 +318,10 @@ describe('applying to Naukri jobs (fake pages)', () => {
       ).run(raced, new Date().toISOString(), new Date().toISOString());
     };
     const fake = await serveFakeNaukri(context, [{ id: '100000000002', kind: 'one-click' }]);
+    const queued = queueFor(settings);
     events.on('event', otherRunApplies);
     try {
-      await applyToJobs(context_({ runId: createRunRow('RUN-TEST-2') }), {});
+      await applyToJobs(context_({ runId: createRunRow('RUN-TEST-2') }), queued, {});
     } finally {
       events.off('event', otherRunApplies);
     }
@@ -335,12 +348,15 @@ describe('applying to Naukri jobs (fake pages)', () => {
     expect(applicationQueue(db, { scope: settings, minMatchScore: 75, isAnswered: () => false }).jobs).toHaveLength(1_200);
 
     // 150 of them through the browser, with auto apply off so each is a quick look.
-    db.exec(`UPDATE jobs SET status = 'SKIPPED' WHERE id > 150`);
+    db.exec(`UPDATE jobs SET match_score = 10 WHERE id > 150`);
     for (let i = 0; i < 150; i++) fakeJobs.push({ id: String(300000000000 + i), kind: 'one-click' });
     const fake = await serveFakeNaukri(context, fakeJobs);
     const stats: Record<string, number> = {};
-    await applyToJobs(context_({ runId: createRunRow(), settings: { ...settings, autoApply: false } }), stats);
-    expect(stats).toMatchObject({ queued: 150, processed: 150 });
+    const checkOnly = { ...settings, autoApply: false };
+    const queue = queueFor(checkOnly);
+    expect(queue).toHaveLength(150);
+    await applyToJobs(context_({ runId: createRunRow(), settings: checkOnly }), queue, stats);
+    expect(stats).toMatchObject({ processed: 150 });
     const results = listApplications(db, { runId: 'RUN-TEST' });
     expect(results).toHaveLength(150);
     expect(results.every((a) => a.status === 'READY_TO_APPLY')).toBe(true);
@@ -349,7 +365,7 @@ describe('applying to Naukri jobs (fake pages)', () => {
 });
 
 describe('application runs', () => {
-  const options = () => ({ configDir, waitMs: 2_000, browseDelayMs: [0, 0] as [number, number] });
+  const options = () => ({ dirs: { config: configDir, data: dataDir }, waitMs: 2_000, browseDelayMs: [0, 0] as [number, number] });
 
   it('stops the whole run on a security check and records it against the job', async () => {
     addJob('100000000001', 95, 'First', { hoursAgo: 1 });
@@ -360,7 +376,7 @@ describe('application runs', () => {
       { id: '100000000002', kind: 'challenge' },
       { id: '100000000003', kind: 'one-click' },
     ]);
-    const run = await runApplications(page, db, settings, options()).done;
+    const run = await runApplications(page, db, env, settings, options()).done;
 
     expect(run).toMatchObject({ status: 'STOPPED', stopCode: 'SECURITY_CHALLENGE', attempted: 2 });
     expect(run.outcomes).toMatchObject({ applied: 1, failed: 1 });
@@ -371,7 +387,7 @@ describe('application runs', () => {
   it('refuses to start when the Naukri session is gone', async () => {
     addJob('100000000001', 95);
     const fake = await serveFakeNaukri(context, [{ id: '100000000001', kind: 'one-click' }], { loggedIn: false });
-    const run = await runApplications(page, db, settings, options()).done;
+    const run = await runApplications(page, db, env, settings, options()).done;
     expect(run).toMatchObject({ status: 'STOPPED', stopCode: 'SESSION_EXPIRED', attempted: 0 });
     expect(fake.clicks.size).toBe(0);
   });
@@ -390,7 +406,7 @@ describe('application runs', () => {
     };
     events.on('event', pauseAfterFirst);
     try {
-      const done = runApplications(page, db, settings, { ...options(), whilePaused: () => paused ?? Promise.resolve() }).done;
+      const done = runApplications(page, db, env, settings, { ...options(), whilePaused: () => paused ?? Promise.resolve() }).done;
       await new Promise((wait) => setTimeout(wait, 3_000));
       expect(listApplications(db).map((a) => a.company)).toEqual(['First']);
       paused = null;
@@ -416,11 +432,11 @@ describe('application runs', () => {
     };
     events.on('event', stopAfterFirst);
     try {
-      const run = await runApplications(page, db, { ...settings, delaySeconds: 30 }, { ...options(), signal: abort.signal }).done;
+      const run = await runApplications(page, db, env, { ...settings, delaySeconds: 30 }, { ...options(), signal: abort.signal }).done;
       expect(run).toMatchObject({ status: 'STOPPED', stopReason: 'Stopped from the dashboard', stopCode: null, attempted: 1 });
       expect(fake.clicks.get('100000000002')).toBeUndefined();
       const types = runEvents(db, { runId: run.id }).map((e) => e.type);
-      expect(types).toEqual(['RUN_STARTED', 'RUN_STOPPED']);
+      expect(types).toEqual(['RUN_STARTED', 'QUEUE_READY', 'RUN_STOPPED']);
     } finally {
       events.off('event', stopAfterFirst);
     }
@@ -433,11 +449,48 @@ describe('application runs', () => {
     const listen = (event: BotEvent) => seen.push(event.type);
     events.on('event', listen);
     try {
-      const run = await runApplications(page, db, settings, options()).done;
-      expect(run).toMatchObject({ status: 'COMPLETED', stats: { queued: 1, excluded: 0 }, attempted: 1 });
+      const run = await runApplications(page, db, env, settings, options()).done;
+      expect(run).toMatchObject({ status: 'COMPLETED', stats: { relevant: 1, eligible: 1, queued: 1, processed: 1 }, attempted: 1 });
       expect(seen[0]).toBe('RUN_STARTED');
       expect(seen).toContain('APPLICATION_CONFIRMED');
       expect(seen.at(-1)).toBe('RUN_COMPLETED');
+    } finally {
+      events.off('event', listen);
+    }
+  });
+
+  it('searches Naukri, sorts what it finds, and applies to every eligible job on its own', async () => {
+    const cards: FakeCard[] = [
+      { id: '200000000001', title: 'React Developer', company: 'Acme', experience: '5-9 Yrs', location: 'Bengaluru' },
+      { id: '200000000002', title: 'Senior React Developer', company: 'Senior Co', experience: '10-15 Yrs', location: 'Bengaluru', hoursAgo: 2 },
+      { id: '200000000003', title: 'Java Developer', company: 'Java Co', experience: '3-6 Yrs', location: 'Bengaluru', hoursAgo: 3 },
+      { id: '200000000004', title: 'React Developer', company: 'Site Co', experience: '4-8 Yrs', location: 'Bengaluru', hoursAgo: 4, external: true },
+      { id: '200000000005', title: 'React Developer', company: 'Old Co', experience: '4-8 Yrs', location: 'Bengaluru', hoursAgo: 72 },
+    ];
+    const fake = await serveFakeNaukri(context, cards.map((card) => ({ id: card.id, kind: 'one-click' as const })), { search: cards });
+    const seen: string[] = [];
+    const listen = (event: BotEvent) => seen.push(event.type);
+    events.on('event', listen);
+    try {
+      const auto = { ...settings, search: true, profiles: ['react'], locations: ['Bangalore'], freshness: '24h' as const, experienceYears: 7, toleranceMonths: 6 };
+      const run = await runApplications(page, db, env, auto, options()).done;
+
+      expect(run).toMatchObject({
+        status: 'COMPLETED',
+        stats: { found: 5, new: 5, relevant: 3, eligible: 2, notEligible: 1, external: 1, queued: 1, processed: 1 },
+        outcomes: { applied: 1 },
+      });
+      // Only the eligible job on Naukri itself was clicked; the too-senior, unrelated, external and old ones weren't.
+      expect([...fake.clicks.keys()]).toEqual(['200000000001']);
+      expect(seen.indexOf('SEARCH_FINISHED')).toBeLessThan(seen.indexOf('QUEUE_READY'));
+      expect(seen.indexOf('QUEUE_READY')).toBeLessThan(seen.indexOf('JOB_STARTED'));
+
+      const listed = listJobs(db, { scope: auto }).jobs.map((job) => [job.company, job.category, job.ineligibleReason]);
+      expect(listed).toEqual([
+        ['Acme', 'applied', null],
+        ['Senior Co', 'not_eligible', 'Requires 10+ years'],
+        ['Site Co', 'external', null],
+      ]);
     } finally {
       events.off('event', listen);
     }

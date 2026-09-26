@@ -21,9 +21,7 @@ const STATUSES: Record<string, [Tone, string, string?]> = {
   external: ['muted', '→', 'External'],
   review: ['warn', '!', 'Review'],
   already_applied: ['muted', '✓', 'Already applied'],
-  new: ['muted', '·', 'New'],
-  low_match: ['muted', '▽', 'Low match'],
-  filtered: ['muted', '▽', 'Not a match'],
+  not_eligible: ['muted', '⊘', 'Not eligible'],
   APPLYING: ['info', '…', 'Applying'],
   APPLY_CLICKED: ['info', '…', 'Apply clicked'],
   FORM_OPENED: ['info', '…', 'Form opened'],
@@ -47,8 +45,9 @@ const STATUSES: Record<string, [Tone, string, string?]> = {
   BLOCKED: ['bad', '✗', 'Access denied'],
   UNKNOWN: ['muted', '○', 'Not checked'],
   WAITING_FOR_LOGIN: ['info', '…', 'Waiting for login'],
-  BROWSER_RUNNING: ['good', '●', 'Running'],
+  BROWSER_RUNNING: ['good', '●', 'Ready'],
   BROWSER_STOPPED: ['muted', '○', 'Closed'],
+  PROFILE_READY: ['good', '✓', 'Profile ready'],
 };
 
 export function StatusBadge({ status }: { status: string }) {

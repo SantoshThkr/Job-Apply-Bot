@@ -6,15 +6,26 @@ import { buildSearchUrl, searchResultPages, type SearchQuery } from '../browser/
 import { RunStopped } from '../browser/session.ts';
 import type { Env, JobProfile, Profile } from '../config.ts';
 import { insertJob, jobsNeedingDetails, recordDetailFailure, saveJobDetails } from '../db/jobs.ts';
-import type { Freshness, JobScope } from '../domain.ts';
+import type { JobScope } from '../domain.ts';
 import { log } from '../logger.ts';
 import { applyHardFilters } from './matching.ts';
 import { normalizeCard } from './normalization.ts';
 
 const isRemote = (location: string) => /^(remote|work from home|wfh)$/i.test(location.trim());
 
-// Naukri's freshness filter works in whole days; the exact window is applied locally afterwards.
-const JOB_AGE: Record<Freshness, number | null> = { today: 1, '24h': 1, '3d': 3, '7d': 7, all: null };
+// Naukri's freshness filter offers these day counts; the exact window is applied locally afterwards.
+const NAUKRI_DAYS = [1, 3, 7, 15, 30];
+const DAYS: Partial<Record<JobScope['freshness'], number>> = { today: 1, '24h': 1, '2d': 2, '3d': 3, '7d': 7 };
+
+// The smallest Naukri freshness filter that covers the window, or null for no filter.
+export function naukriJobAge(scope: Pick<JobScope, 'freshness' | 'from'>, now = new Date()): number | null {
+  let days = DAYS[scope.freshness];
+  if (scope.freshness === 'custom' && scope.from) {
+    const [y, m, d] = scope.from.split('-').map(Number);
+    days = Math.max(1, Math.ceil((now.getTime() - new Date(y!, m! - 1, d!).getTime()) / 86_400_000));
+  }
+  return days === undefined ? null : (NAUKRI_DAYS.find((n) => n >= days) ?? null);
+}
 
 // One query per profile keyword for your cities, plus one with Naukri's Remote filter when "Remote"
 // is one of your locations. --keyword searches just that keyword instead.
@@ -25,15 +36,17 @@ export function planQueries(
     keywords = [],
     locations = [],
     freshness = 'all',
-  }: { keywords?: string[]; locations?: string[]; freshness?: Freshness } = {},
+    from = null,
+  }: { keywords?: string[]; locations?: string[] } & Partial<Pick<JobScope, 'freshness' | 'from'>> = {},
 ): SearchQuery[] {
   const groups = keywords.length ? [{ id: 'command line', keywords }] : jobProfiles;
   const wanted = locations.length ? locations : profile.preferredLocations;
   const cities = wanted.filter((l) => !isRemote(l));
+  const jobAge = naukriJobAge({ freshness, from });
   const seen = new Set<string>();
   return groups
     .flatMap((group) => {
-      const base = { searchName: group.id, jobAge: JOB_AGE[freshness] };
+      const base = { searchName: group.id, jobAge };
       return group.keywords.flatMap((keyword) => [
         ...(cities.length ? [{ ...base, keyword, locations: cities, remote: false }] : []),
         ...(wanted.some(isRemote) ? [{ ...base, keyword, locations: [], remote: true }] : []),
@@ -62,13 +75,20 @@ export async function discoverJobs(
   db: DatabaseSync,
   queries: SearchQuery[],
   env: Env,
-  signal?: AbortSignal,
-): Promise<{ seen: number; added: number }> {
+  {
+    signal,
+    whilePaused,
+    onPage,
+  }: { signal?: AbortSignal; whilePaused?: () => Promise<void>; onPage?: (progress: { found: number; added: number }) => void } = {},
+): Promise<{ seen: number; added: number; found: number }> {
   let seen = 0;
   let added = 0;
+  // The same job often turns up under several keywords.
+  const found = new Set<string>();
 
   const cap = env.MAX_JOBS_PER_RUN ?? Infinity;
   for (const [index, query] of queries.entries()) {
+    await whilePaused?.();
     if (signal?.aborted) break;
     if (added >= cap) {
       log.info(`Reached MAX_JOBS_PER_RUN (${cap}); skipping ${queries.length - index} remaining search(es)`);
@@ -88,6 +108,7 @@ export async function discoverJobs(
           if (added >= cap) break;
           const job = normalizeCard(raw);
           if (!job) continue;
+          found.add(job.externalId ?? job.url);
           if (insertJob(db, job, query.searchName)) {
             added++;
             fresh++;
@@ -96,6 +117,7 @@ export async function discoverJobs(
           }
         }
         log.info(`  Page ${pageNo}: ${cards.length} jobs, ${fresh} new${known ? `, ${known} already stored` : ''}`);
+        onPage?.({ found: found.size, added });
         // A page of nothing new means this search is already covered; don't dig deeper.
         if (fresh === 0 || added >= cap || signal?.aborted) break;
         await politePause(page, env);
@@ -103,10 +125,10 @@ export async function discoverJobs(
     } catch (err) {
       stopIfClosed(page, err);
       log.warn(`Search failed: ${describeQuery(query)}`, err);
-      await saveDebugScreenshot(page, 'search');
+      if (env.DEBUG_SCREENSHOTS) await saveDebugScreenshot(page, 'search');
     }
   }
-  return { seen, added };
+  return { seen, added, found: found.size };
 }
 
 export async function fetchMissingDetails(
@@ -134,7 +156,7 @@ export async function fetchMissingDetails(
       recordDetailFailure(db, job.id);
       failed++;
       log.warn(`Could not read ${job.title} at ${job.company}`, err);
-      await saveDebugScreenshot(page, 'job-details');
+      if (env.DEBUG_SCREENSHOTS) await saveDebugScreenshot(page, 'job-details');
     }
     if ((index + 1) % 10 === 0) log.info(`  ${index + 1}/${jobs.length} read`);
   }
@@ -157,11 +179,11 @@ export async function searchJobs(
   log.info(`${queries.length} search(es) planned, up to ${env.SEARCH_MAX_PAGES} result page(s) each`);
   for (const query of queries) log.debug(`  ${describeQuery(query)}`);
 
-  const { seen, added } = await discoverJobs(page, db, queries, env, signal);
+  const { seen, added } = await discoverJobs(page, db, queries, env, { signal });
   Object.assign(stats, { seen, added });
   log.info(`Found ${seen} jobs, ${added} new`);
 
-  const { rejected } = applyHardFilters(db, profile, jobProfiles);
+  const { rejected } = applyHardFilters(db, jobProfiles);
   stats.filtered = rejected;
   if (rejected) log.info(`Filtered out ${rejected} job(s) on location or title before reading descriptions`);
   if (signal?.aborted) return;

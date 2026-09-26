@@ -3,13 +3,13 @@ import {
   OUTCOMES,
   type ApplicationRow,
   type ApplicationStatus,
-  type ApplicationSummary,
   type FailureCode,
+  type JobCategory,
   type JobScope,
-  type Outcome,
   type OutcomeCounts,
+  type ScopeSummary,
 } from '../domain.ts';
-import { IN_SCOPE, JOB_CATEGORY, scopeParams } from './jobs.ts';
+import { IN_SCOPE, JOB_CATEGORY, categoryParams, scopeParams } from './jobs.ts';
 
 // Attempts only move forward. APPLIED needs SUBMIT_CLICKED first and a confirmed success (checked in
 // updateApplication). Once a click may have sent the application (Apply on a job without questions,
@@ -167,13 +167,15 @@ export interface QueueItem {
   jobId: number;
   company: string;
   title: string;
-  score: number;
+  score: number | null;
   url: string;
   postedAt: string | null;
+  hasDescription: boolean;
 }
 
 interface QueueRow extends QueueItem {
   jobStatus: string;
+  category: JobCategory;
   externalApply: number | null;
   lastStatus: ApplicationStatus | null;
   lastCode: FailureCode | null;
@@ -192,6 +194,7 @@ const MAX_FAILURES = 3;
 function exclusionReason(row: QueueRow, isAnswered: (question: string) => boolean): string | null {
   if (row.jobStatus === 'APPLIED') return 'Already applied';
   if (row.externalApply) return "Applies on the company's site";
+  if (row.category === 'not_eligible') return 'Not eligible';
   switch (row.lastStatus) {
     case null:
     case 'READY_TO_APPLY':
@@ -220,41 +223,52 @@ function exclusionReason(row: QueueRow, isAnswered: (question: string) => boolea
   }
 }
 
-// Shortlisted jobs in scope at or above the score, freshest first. No cap: a run works through all of them.
+export interface QueueOptions {
+  scope: JobScope;
+  minMatchScore: number;
+  isAnswered: (question: string) => boolean;
+  now?: Date;
+}
+
+// Every job in scope that can be applied to now, freshest first. No cap: a run works through all of them.
 export function applicationQueue(
   db: DatabaseSync,
-  { scope, minMatchScore, isAnswered, now = new Date() }: { scope: JobScope; minMatchScore: number; isAnswered: (question: string) => boolean; now?: Date },
+  { scope, minMatchScore, isAnswered, now = new Date() }: QueueOptions,
 ): { jobs: QueueItem[]; excluded: { jobId: number; reason: string }[] } {
   const rows = db
     .prepare(
       `SELECT j.id AS jobId, j.company, j.title, j.match_score AS score, j.url, j.posted_at AS postedAt, j.status AS jobStatus,
-              j.external_apply AS externalApply, ap.status AS lastStatus, ap.failure_code AS lastCode,
+              j.description IS NOT NULL AS hasDescription,
+              ${JOB_CATEGORY} AS category, j.external_apply AS externalApply, ap.status AS lastStatus, ap.failure_code AS lastCode,
               ap.question AS lastQuestion, ap.run_id AS lastRunId, ap.apply_clicked AS lastClicked,
               ap.form_opened AS lastFormOpened, ap.submit_clicked AS lastSubmitted,
               (SELECT count(*) FROM applications f WHERE f.job_id = j.id AND f.status = 'FAILED'
                  AND coalesce(f.failure_code, '') NOT IN ('RUN_STOPPED', 'INTERRUPTED', 'BROWSER_CLOSED')) AS failures
        FROM jobs j
        LEFT JOIN applications ap ON ap.id = (SELECT max(id) FROM applications WHERE job_id = j.id)
-       WHERE j.status IN ('SHORTLISTED', 'APPLIED') AND j.match_score >= :minMatchScore AND ${IN_SCOPE}
-       ORDER BY julianday(j.posted_at) DESC NULLS LAST, j.match_score DESC, j.id`,
+       WHERE ${IN_SCOPE}
+       ORDER BY julianday(j.posted_at) DESC NULLS LAST, j.id DESC`,
     )
-    .all({ minMatchScore, ...scopeParams(scope, now) }) as unknown as QueueRow[];
+    .all({ ...categoryParams(scope, minMatchScore), ...scopeParams(scope, now) }) as unknown as QueueRow[];
 
   const jobs: QueueItem[] = [];
   const excluded: { jobId: number; reason: string }[] = [];
   for (const row of rows) {
     const reason = exclusionReason(row, isAnswered);
     if (reason) excluded.push({ jobId: row.jobId, reason });
-    else jobs.push({ jobId: row.jobId, company: row.company, title: row.title, score: row.score, url: row.url, postedAt: row.postedAt });
+    else {
+      const { jobId, company, title, score, url, postedAt } = row;
+      jobs.push({ jobId, company, title, score, url, postedAt, hasDescription: Boolean(row.hasDescription) });
+    }
   }
   return { jobs, excluded };
 }
 
-// Where the jobs in scope stand. Each job counts once, by its latest attempt.
-export function applicationSummary(
-  db: DatabaseSync,
-  { scope, minMatchScore, isAnswered, now = new Date() }: { scope: JobScope; minMatchScore: number; isAnswered: (question: string) => boolean; now?: Date },
-): Pick<ApplicationSummary, 'counts' | 'queued' | 'awaitingMatch'> {
+const emptyCategories = (): Record<JobCategory, number> => ({ ...emptyCounts(), not_eligible: 0 });
+
+// Where the jobs in scope stand. Each job counts once, by its status.
+export function scopeSummary(db: DatabaseSync, options: QueueOptions): Omit<ScopeSummary, 'problems' | 'minMatchScore'> {
+  const { scope, minMatchScore, now = new Date() } = options;
   const rows = db
     .prepare(
       `SELECT category, count(*) AS n FROM (
@@ -263,31 +277,9 @@ export function applicationSummary(
          WHERE ${IN_SCOPE}
        ) GROUP BY category`,
     )
-    .all({ outcomes: JSON.stringify(OUTCOMES), ...scopeParams(scope, now) }) as { category: string; n: number }[];
-  const counts = emptyCounts();
-  let awaitingMatch = 0;
-  for (const { category, n } of rows) {
-    if (category in counts) counts[category as Outcome] += n;
-    else if (category === 'new') awaitingMatch += n;
-  }
-  return { counts, awaitingMatch, queued: applicationQueue(db, { scope, minMatchScore, isAnswered, now }).jobs.length };
-}
-
-// Same categories as the Apply page: Applied means the bot sent it and Naukri confirmed it.
-export function dashboardCounts(db: DatabaseSync, now = new Date()): { jobsFound: number; freshJobs: number; applied: number; failed: number } {
-  return db
-    .prepare(
-      `SELECT count(*) AS jobsFound,
-              count(*) FILTER (WHERE julianday(posted_at) >= julianday(:since)) AS freshJobs,
-              count(*) FILTER (WHERE category = 'applied') AS applied,
-              count(*) FILTER (WHERE category = 'failed') AS failed
-       FROM (SELECT j.posted_at, ${JOB_CATEGORY} AS category FROM jobs j
-             LEFT JOIN applications ap ON ap.id = (SELECT max(id) FROM applications WHERE job_id = j.id))`,
-    )
-    .get({ outcomes: JSON.stringify(OUTCOMES), since: new Date(now.getTime() - 24 * 3_600_000).toISOString() }) as {
-    jobsFound: number;
-    freshJobs: number;
-    applied: number;
-    failed: number;
-  };
+    .all({ ...categoryParams(scope, minMatchScore), ...scopeParams(scope, now) }) as { category: JobCategory; n: number }[];
+  const counts = emptyCategories();
+  for (const { category, n } of rows) counts[category] += n;
+  const found = Object.values(counts).reduce((a, b) => a + b, 0);
+  return { found, eligible: found - counts.not_eligible, counts, queued: applicationQueue(db, options).jobs.length };
 }

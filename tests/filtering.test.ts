@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { hardFilterReason, locationMatches, matchingProfiles, type FilterableJob } from '../src/jobs/filtering.ts';
+import { expandLocations, hardFilterReason, jobCities, locationMatches, matchingProfiles, type FilterableJob } from '../src/jobs/filtering.ts';
 import { testJobProfiles, testProfile } from './fixtures.ts';
 
 const job = (overrides: Partial<FilterableJob>): FilterableJob => ({
@@ -10,10 +10,7 @@ const job = (overrides: Partial<FilterableJob>): FilterableJob => ({
   ...overrides,
 });
 
-const reasonFor = (overrides: Partial<FilterableJob>) => {
-  const candidate = job(overrides);
-  return hardFilterReason(candidate, testProfile, matchingProfiles(candidate, testJobProfiles));
-};
+const reasonFor = (overrides: Partial<FilterableJob>) => hardFilterReason(matchingProfiles(job(overrides), testJobProfiles));
 const profilesOf = (title: string, skills: string[] = []) => matchingProfiles({ title, skills }, testJobProfiles);
 
 describe('locationMatches', () => {
@@ -69,15 +66,22 @@ describe('hardFilterReason', () => {
     expect(reasonFor({ title: 'Sr. Developer', skills: ['Ai', 'Css', 'Finance'] })).not.toBeNull();
   });
 
-  it('never rejects a job for its experience range', () => {
-    // FilterableJob has no experience at all: the card's "0-2 Yrs" or "15+ Yrs" can't reach this check.
-    expect(reasonFor({ title: 'Junior React Developer' })).toBeNull();
+  it('leaves experience and location to each run: a relevant title is never set aside for them', () => {
     expect(reasonFor({ title: 'Principal Frontend Architect (15+ years)' })).toBeNull();
+    expect(reasonFor({ location: 'Chennai' })).toBeNull();
+  });
+});
+
+describe('cities', () => {
+  it('lists a job\'s cities in canonical form, with Remote for a remote job', () => {
+    expect(jobCities({ location: 'Hybrid - Bengaluru, Gurgaon', workMode: 'Hybrid' })).toEqual(['Bangalore', 'Gurugram']);
+    expect(jobCities({ location: 'Pune', workMode: 'Remote' })).toEqual(['Pune', 'Remote']);
+    expect(jobCities({ location: null, workMode: null })).toEqual([]);
   });
 
-  it('rejects locations outside the preferred list, but never remote jobs', () => {
-    expect(reasonFor({ location: 'Chennai' })).toBe('Not in your preferred locations (Chennai)');
-    expect(reasonFor({ location: 'Remote', workMode: 'Remote' })).toBeNull();
+  it('expands a region into its cities', () => {
+    expect(expandLocations(['Delhi NCR'])).toEqual(expect.arrayContaining(['Delhi NCR', 'Noida', 'Gurugram']));
+    expect(expandLocations(['bengaluru'])).toEqual(['Bangalore']);
   });
 });
 
@@ -99,6 +103,14 @@ describe('matchingProfiles', () => {
     expect(profilesOf('Java Full Stack Developer')).toEqual(['fullstack']);
     expect(profilesOf('Senior DevOps Engineer')).toEqual([]);
     expect(profilesOf('JavaScript Developer')).toEqual(['frontend', 'web', 'broad']);
+  });
+
+  it('keeps backend-stack titles out of the frontend-only profiles, but not out of Full Stack', () => {
+    expect(profilesOf('Java + Angular (3-9 YRS) @ Infosys')).toEqual([]);
+    expect(profilesOf('Java Full Stack Developer (Spring Boot + React/Angular)')).toEqual(['fullstack']);
+    expect(profilesOf('.NET REACT @ Infosys')).toEqual([]);
+    expect(profilesOf('Python Fullstack Developer (Python, Fast Api, React.JS & AWS)')).toEqual(['fullstack', 'broad']);
+    expect(profilesOf('Senior Frontend Engineer : React / Next.js')).toEqual(['frontend', 'react', 'fullstack', 'broad']);
   });
 
   it('reads profiles from configuration, so new ones need no code', () => {

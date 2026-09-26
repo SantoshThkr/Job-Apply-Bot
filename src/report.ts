@@ -21,12 +21,14 @@ export function formatRunReport(run: Run, applications: ApplicationRow[]): strin
   const heading = { RUNNING: 'IN PROGRESS', PAUSED: 'PAUSED', COMPLETED: 'COMPLETED', STOPPED: 'STOPPED', FAILED: 'FAILED' }[run.status];
   const lines = [
     RULE,
-    `APPLICATION RUN ${heading}`,
+    `AUTO APPLY RUN ${heading}`,
     RULE,
     '',
     `Run ID: ${run.id}`,
     ...(run.stopReason ? [`Reason: ${run.stopReason}`] : []),
     '',
+    ...(run.stats.found !== undefined ? [row('Found by the search', run.stats.found), row('New', run.stats.new ?? 0)] : []),
+    ...(run.stats.relevant !== undefined ? [row('Relevant', run.stats.relevant), row('Eligible', run.stats.eligible ?? 0)] : []),
     row('Queued', run.stats.queued ?? 0),
     row('Attempted', run.attempted),
     ...(['applied', 'failed', 'external', 'review', 'already_applied', 'ready', 'applying'] as const)

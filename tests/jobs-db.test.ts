@@ -77,6 +77,9 @@ describe('jobs table', () => {
     insertJob(db, card(), 'AI');
     const second = card({ externalId: '444455556666', url: 'https://www.naukri.com/job-listings-x-444455556666', title: 'ML Engineer' });
     insertJob(db, second, 'AI');
+    // Only jobs sorted into a job profile are worth reading.
+    expect(jobsNeedingDetails(db, { limit: 10 })).toEqual([]);
+    db.exec(`UPDATE jobs SET profiles = '["ai"]'`);
     const [first, other] = jobsNeedingDetails(db, { limit: 10 });
 
     saveJobDetails(db, first!.id, {
@@ -101,7 +104,7 @@ describe('jobs table', () => {
 });
 
 describe('status transitions', () => {
-  it('allows the normal flow and re-analysis, and nothing after APPLIED', () => {
+  it('allows the normal flow and re-analysis, APPLIED from anywhere, and nothing after APPLIED', () => {
     expect(canTransition('DISCOVERED', 'SHORTLISTED')).toBe(true);
     expect(canTransition('SHORTLISTED', 'SKIPPED')).toBe(true);
     expect(canTransition('SKIPPED', 'DISCOVERED')).toBe(true);
@@ -110,16 +113,17 @@ describe('status transitions', () => {
     expect(canTransition('DISCOVERED', 'ANALYSIS_FAILED')).toBe(true);
     expect(canTransition('ANALYSIS_FAILED', 'SHORTLISTED')).toBe(true);
     expect(canTransition('SHORTLISTED', 'ANALYSIS_FAILED')).toBe(false);
-    expect(canTransition('DISCOVERED', 'APPLIED')).toBe(false);
     expect(canTransition('SHORTLISTED', 'READY_TO_SUBMIT')).toBe(false);
+    // Naukri's confirmation outranks everything: most jobs are applied to before any AI match.
+    for (const status of JOB_STATUSES) expect(canTransition(status, 'APPLIED')).toBe(true);
     for (const status of JOB_STATUSES.filter((s) => s !== 'APPLIED')) expect(canTransition('APPLIED', status)).toBe(false);
   });
 
   it('refuses an invalid move and records score and filter reason on a valid one', () => {
     const db = openDatabase(':memory:');
     insertJob(db, card(), 'AI');
-    const id = jobsNeedingDetails(db, { limit: 1 })[0]!.id;
-    expect(() => updateJobStatus(db, id, 'APPLIED', { matchScore: null, filterReason: null })).toThrow(/cannot move from DISCOVERED to APPLIED/);
+    const { id } = db.prepare('SELECT id FROM jobs').get() as { id: number };
+    expect(() => updateJobStatus(db, id, 'READY_TO_SUBMIT', { matchScore: null, filterReason: null })).toThrow(/cannot move from DISCOVERED to READY_TO_SUBMIT/);
     updateJobStatus(db, id, 'SKIPPED', { matchScore: null, filterReason: 'Needs 15+ years' });
     expect(db.prepare('SELECT status, filter_reason FROM jobs WHERE id = ?').get(id)).toEqual({
       status: 'SKIPPED',

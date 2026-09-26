@@ -1,11 +1,14 @@
 'use client';
 
-import type { StatusResponse } from '@bot/domain';
+import type { ScopeSummary, StatusResponse } from '@bot/domain';
+import Link from 'next/link';
 import { useState } from 'react';
 import { CurrentRun, RunControls } from '@/components/live';
-import { Button, ErrorText, Panel, Stat, StatusBadge } from '@/components/ui';
+import { RunSummary, ScopeCounts, SettingsLine } from '@/components/summary';
+import { Button, ErrorText, Panel, StatusBadge } from '@/components/ui';
 import { post, useApi } from '@/lib/api';
 import { useLive } from '@/lib/live';
+import { scopeQuery, useSettings } from '@/lib/scope';
 
 const SESSION_HINTS: Record<string, string> = {
   WAITING_FOR_LOGIN: 'Log in to Naukri in the Chrome window, including any OTP or CAPTCHA. This updates when your Naukri homepage opens; click Check if it does not.',
@@ -16,7 +19,9 @@ const SESSION_HINTS: Record<string, string> = {
 
 export default function DashboardPage() {
   const { version, state } = useLive();
+  const { settings } = useSettings();
   const { data, error } = useApi<StatusResponse>('/api/status', version);
+  const { data: summary } = useApi<ScopeSummary>(`/api/summary?${scopeQuery(settings)}`, version);
   const [pending, setPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const busy = pending || Boolean(state?.activity);
@@ -59,11 +64,16 @@ export default function DashboardPage() {
             )}
           </dd>
           <dt className="text-slate-500">AI</dt>
-          <dd className="flex items-center gap-2">
-            <span aria-hidden="true" className="text-emerald-600">
-              ●
-            </span>
-            {data ? `${data.ai.provider} / ${data.ai.model}` : '-'}
+          <dd>{data ? `${data.ai.provider} / ${data.ai.model}` : '-'}</dd>
+          <dt className="text-slate-500">Profile</dt>
+          <dd>
+            {data?.profileReady ? (
+              <StatusBadge status="PROFILE_READY" />
+            ) : (
+              <Link href="/profile" className="text-sm text-sky-700 underline">
+                Set up your profile
+              </Link>
+            )}
           </dd>
         </dl>
         {state && SESSION_HINTS[state.session] && <p className="mt-3 text-sm text-slate-700">{SESSION_HINTS[state.session]}</p>}
@@ -72,15 +82,13 @@ export default function DashboardPage() {
         </div>
       </Panel>
 
-      <dl className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <Stat label="Jobs found" value={data?.counts.jobsFound ?? '-'} />
-        <Stat label="Fresh jobs (24h)" value={data?.counts.freshJobs ?? '-'} />
-        <Stat label="Applied" value={data?.counts.applied ?? '-'} />
-        <Stat label="Failed" value={data?.counts.failed ?? '-'} />
-      </dl>
+      <div className="space-y-2">
+        <SettingsLine />
+        <ScopeCounts summary={summary} foundLabel="Fresh jobs" />
+      </div>
 
       <Panel title="Current run" actions={<RunControls />}>
-        <CurrentRun />
+        {state?.activeRun || !data?.lastRun ? <CurrentRun /> : <RunSummary run={data.lastRun} />}
       </Panel>
     </div>
   );

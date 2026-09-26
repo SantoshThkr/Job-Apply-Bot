@@ -3,25 +3,29 @@
     "id": "frontend",
     "name": "Frontend Developer",
     "keywords": ["Frontend Developer", "Frontend Engineer", "UI Developer"],
-    "skills": ["JavaScript", "TypeScript", "React", "Angular", "Vue", "HTML", "CSS"]
+    "skills": ["JavaScript", "TypeScript", "React", "Angular", "Vue", "HTML", "CSS"],
+    "exclude": ["Java", "Spring", ".NET", "Dot Net", "C#", "Python", "PHP", "SAP", "Salesforce"]
   },
   {
     "id": "react",
     "name": "React.js Developer",
     "keywords": ["React Developer", "React.js Developer"],
-    "skills": ["React", "Next.js", "Redux"]
+    "skills": ["React", "Next.js", "Redux"],
+    "exclude": ["Java", "Spring", ".NET", "Dot Net", "C#", "Python", "PHP", "SAP", "Salesforce"]
   },
   {
     "id": "angular",
     "name": "Angular Developer",
     "keywords": ["Angular Developer"],
-    "skills": ["Angular", "RxJS", "NgRx"]
+    "skills": ["Angular", "RxJS", "NgRx"],
+    "exclude": ["Java", "Spring", ".NET", "Dot Net", "C#", "Python", "PHP", "SAP", "Salesforce"]
   },
   {
     "id": "web",
     "name": "Web Developer",
     "keywords": ["Web Developer", "Web Application Developer"],
-    "skills": ["JavaScript", "HTML", "CSS"]
+    "skills": ["JavaScript", "HTML", "CSS"],
+    "exclude": ["Java", "Spring", ".NET", "Dot Net", "C#", "Python", "PHP", "SAP", "Salesforce"]
   },
   {
     "id": "fullstack",

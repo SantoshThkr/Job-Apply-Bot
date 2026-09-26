@@ -18,6 +18,11 @@ describe('privatePathReason', () => {
     'data/browser-profile/Default/Cookies',
     'config/profile.json',
     'config/answers.json',
+    'data/user-profile.json',
+    'data/answers.json',
+    'data/resume/cv.pdf',
+    'data/jobs.db-wal',
+    'user-profile.json',
     'resume/cv.pdf',
     'jobs.sqlite',
     'logs/2026-09-25.log',
@@ -27,7 +32,7 @@ describe('privatePathReason', () => {
     expect(privatePathReason(path)).toBeDefined();
   });
 
-  it.each(['.env.example', 'config/profile.example.json', 'resume/README.md', 'src/browser/session.ts', 'README.md'])(
+  it.each(['.env.example', 'config/job-profiles.example.json', 'data/user-profile.example.json', 'data/answers.example.json', 'resume/README.md', 'src/browser/session.ts', 'README.md'])(
     'allows %s',
     (path) => {
       expect(privatePathReason(path)).toBeUndefined();

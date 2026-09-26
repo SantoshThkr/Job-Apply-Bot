@@ -6,10 +6,10 @@ import type { Page } from 'playwright';
 import { createApi } from './api.ts';
 import { firstPage, launchBrowser } from './browser/browser.ts';
 import { BLOCKED_MESSAGE, SESSION_MESSAGES, checkSession, disableManualPauses, waitForManualLogin } from './browser/session.ts';
-import { ConfigError, ROOT, loadEnv, loadJobProfiles, loadProfile, type Env, type JobProfile, type Profile } from './config.ts';
+import { ConfigError, ROOT, loadEnv, loadJobProfiles, loadProfile, matchProfile, requireUserProfile, type Env, type JobProfile, type Profile } from './config.ts';
 import { createProvider } from './ai/providers.ts';
 import { matchCounts, rankedJobs } from './db/analysis.ts';
-import { applicationSummary, listApplications } from './db/applications.ts';
+import { listApplications, scopeSummary } from './db/applications.ts';
 import { openDatabase } from './db/database.ts';
 import { countAwaitingDetails, jobCounts } from './db/jobs.ts';
 import { closeAbandonedRuns, getRun, listRuns } from './db/runs.ts';
@@ -17,7 +17,8 @@ import { BotControl } from './control.ts';
 import { FRESHNESS, JOB_STATUSES, type Freshness, type JobScope, type JobStatus, type MatchBand, type Run } from './domain.ts';
 import { planQueries } from './jobs/discovery.ts';
 import { applyHardFilters } from './jobs/matching.ts';
-import { applySettingsFrom, runAnalysis, runApplications, runSearch } from './jobs/runs.ts';
+import { applySettingsFrom, loadApplicationConfig, runAnalysis, runApplications, runSearch } from './jobs/runs.ts';
+import { isAnsweredBy } from './jobs/applying.ts';
 import { log } from './logger.ts';
 import { formatRunReport } from './report.ts';
 
@@ -105,27 +106,40 @@ function exitWith(run: Run): Run {
   return run;
 }
 
-// --profile frontend,react (ids from config/job-profiles.json) and --fresh today|24h|3d|7d|all.
-const SCOPE_OPTIONS = { profile: { type: 'string' }, fresh: { type: 'string' } } as const;
+// --profile frontend,react (ids from config/job-profiles.json), --fresh today|24h|2d|3d|7d|all, or
+// --from 2026-09-20 [--to 2026-09-26] for a custom range, and --location Bangalore,Remote.
+const SCOPE_OPTIONS = {
+  profile: { type: 'string' },
+  fresh: { type: 'string' },
+  from: { type: 'string' },
+  to: { type: 'string' },
+  location: { type: 'string' },
+} as const;
 
-function scopeFrom(values: { profile?: string; fresh?: string }, jobProfiles: JobProfile[]): JobScope {
-  const profiles = values.profile?.split(',').map((id) => id.trim()).filter(Boolean) ?? [];
+const list = (value: string | undefined) => value?.split(',').map((item) => item.trim()).filter(Boolean) ?? [];
+
+function scopeFrom(values: { profile?: string; fresh?: string; from?: string; to?: string; location?: string }, jobProfiles: JobProfile[]): JobScope {
+  const profiles = list(values.profile);
   const unknown = profiles.filter((id) => !jobProfiles.some((p) => p.id === id));
   if (unknown.length) throw new ConfigError(`Unknown --profile ${unknown.join(', ')}. Profiles: ${jobProfiles.map((p) => p.id).join(', ')}`);
-  const freshness = (values.fresh ?? 'all') as Freshness;
+  const freshness = (values.from ? 'custom' : (values.fresh ?? 'all')) as Freshness;
   if (!FRESHNESS.includes(freshness)) throw new ConfigError(`--fresh must be one of ${FRESHNESS.join(', ')}`);
-  return { profiles, freshness };
+  for (const day of [values.from, values.to]) {
+    if (day && !/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new ConfigError('--from and --to take dates as YYYY-MM-DD');
+  }
+  return { profiles, freshness, from: values.from ?? null, to: values.to ?? null, locations: list(values.location) };
 }
 
 async function runSearchCommand(db: DatabaseSync, env: Env, profile: Profile, args: string[]): Promise<Run> {
-  const { values } = parseArgs({ args, options: { keyword: { type: 'string' }, location: { type: 'string' }, ...SCOPE_OPTIONS } });
+  const { values } = parseArgs({ args, options: { keyword: { type: 'string' }, ...SCOPE_OPTIONS } });
   const jobProfiles = loadJobProfiles();
   const scope = scopeFrom(values, jobProfiles);
   const chosen = scope.profiles.length ? jobProfiles.filter((p) => scope.profiles.includes(p.id)) : jobProfiles;
   const queries = planQueries(chosen, profile, {
     keywords: values.keyword ? [values.keyword] : [],
-    locations: values.location ? [values.location] : [],
+    locations: scope.locations,
     freshness: scope.freshness,
+    from: scope.from,
   });
   return withBrowser(env, async (page, signal) => exitWith(await runSearch(page, db, env, profile, jobProfiles, queries, { scope, signal }).done));
 }
@@ -253,32 +267,50 @@ function printReport(db: DatabaseSync, run: Run): void {
   console.log(`\n${formatRunReport(run, listApplications(db, { runId: run.id }))}\n`);
 }
 
-// Works through every shortlisted job, freshest first. Without --auto-apply (or AUTO_APPLY=true) it
-// only checks each job and stops before Apply, because on Naukri that click sends the application.
+// The same run as the dashboard's Start: search, then apply to every eligible job, freshest first.
+// Without --auto-apply (or AUTO_APPLY=true) it only checks each job and stops before Apply, because on
+// Naukri that click sends the application. --skip-search applies to the jobs already stored.
 async function apply(): Promise<void> {
   const { values } = parseArgs({
     args: process.argv.slice(3),
-    options: { max: { type: 'string' }, 'min-score': { type: 'string' }, 'auto-apply': { type: 'boolean', default: false }, ...SCOPE_OPTIONS },
+    options: {
+      max: { type: 'string' },
+      'min-score': { type: 'string' },
+      'auto-apply': { type: 'boolean', default: false },
+      'skip-search': { type: 'boolean', default: false },
+      experience: { type: 'string' },
+      tolerance: { type: 'string' },
+      ...SCOPE_OPTIONS,
+    },
   });
   const env = loadEnv();
-  const settings = applySettingsFrom(env, scopeFrom(values, loadJobProfiles()));
+  const user = requireUserProfile().profile;
+  const settings = applySettingsFrom(env, {
+    ...scopeFrom(values, loadJobProfiles()),
+    experienceYears: values.experience === undefined ? user.experienceYears : Number(values.experience),
+    toleranceMonths: intOption(values.tolerance, 'tolerance', 0, 60) ?? user.experienceToleranceMonths,
+  });
+  if (!settings.locations?.length) settings.locations = matchProfile(user).preferredLocations;
   settings.limit = intOption(values.max, 'max', 1, 1_000_000) ?? null;
   settings.minMatchScore = intOption(values['min-score'], 'min-score', 0, 100) ?? settings.minMatchScore;
+  settings.search = !values['skip-search'];
   if (values['auto-apply']) settings.autoApply = true;
   printTable([
     ['Profiles', settings.profiles.join(', ') || 'all'],
-    ['Posted', settings.freshness],
-    ['Minimum match score', settings.minMatchScore],
+    ['Locations', settings.locations.join(', ') || 'anywhere'],
+    ['Posted', settings.freshness === 'custom' ? `${settings.from} to ${settings.to ?? 'today'}` : settings.freshness],
+    ['Experience', `${settings.experienceYears} years, ${settings.toleranceMonths} months tolerance`],
+    ['Search first', settings.search ? 'yes' : 'no'],
     ['Jobs', settings.limit ? `first ${settings.limit} in the queue` : 'every eligible job'],
-    ['Auto fill', settings.autoFill ? 'ON' : 'OFF'],
     ['Auto apply', settings.autoApply ? 'ON (applications will be sent)' : 'OFF (stops before Apply)'],
-    ['Delay after applying', `${settings.delaySeconds}s`],
   ]);
 
   const db = openDb();
   try {
     const browseDelayMs: [number, number] = [env.DELAY_MIN_MS, env.DELAY_MAX_MS];
-    await withBrowser(env, async (page, signal) => printReport(db, exitWith(await runApplications(page, db, settings, { browseDelayMs, signal }).done)));
+    await withBrowser(env, async (page, signal) =>
+      printReport(db, exitWith(await runApplications(page, db, env, settings, { browseDelayMs, signal, provider: createProvider(env) }).done)),
+    );
   } finally {
     db.close();
   }
@@ -304,10 +336,11 @@ async function status(): Promise<void> {
     startOfToday.setHours(0, 0, 0, 0);
     const jobs = jobCounts(db, startOfToday);
     const matches = matchCounts(db);
-    const { counts: applications } = applicationSummary(db, {
-      scope: { profiles: [], freshness: 'all' },
+    const config = loadApplicationConfig();
+    const { counts: applications } = scopeSummary(db, {
+      scope: { profiles: [], freshness: 'all', experienceYears: config.facts?.experienceYears ?? null },
       minMatchScore: loadEnv().MIN_MATCH_SCORE,
-      isAnswered: () => false,
+      isAnswered: isAnsweredBy(config.answers, config.facts),
     });
     const rows: [string, number][] = [
       ['Jobs stored', jobs.total],
@@ -327,6 +360,7 @@ async function status(): Promise<void> {
       ['Application failed', applications.failed],
       ['External', applications.external],
       ['Needs review', applications.review],
+      ['Not eligible', applications.not_eligible],
     ];
     for (const [label, value] of rows) console.log(`${`${label}:`.padEnd(24)}${String(value).padStart(5)}`);
     for (const status of JOB_STATUSES.slice(JOB_STATUSES.indexOf('APPLICATION_STARTED'))) {
@@ -345,9 +379,9 @@ async function server(): Promise<void> {
   const db = openDb();
   disableManualPauses();
   const control = new BotControl({ db, env });
-  // Sorts jobs into the current job profiles before the dashboard lists them.
+  // Sorts jobs into the current job profiles and cities before the dashboard lists them.
   try {
-    applyHardFilters(db, loadProfile(), loadJobProfiles());
+    applyHardFilters(db, loadJobProfiles());
   } catch (err) {
     if (!(err instanceof ConfigError)) throw err;
     log.warn(err.message);
