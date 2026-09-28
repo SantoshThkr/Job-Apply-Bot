@@ -285,16 +285,19 @@ async function apply(): Promise<void> {
   });
   const env = loadEnv();
   const user = requireUserProfile().profile;
-  const settings = applySettingsFrom(env, {
-    ...scopeFrom(values, loadJobProfiles()),
-    experienceYears: values.experience === undefined ? user.experienceYears : Number(values.experience),
-    toleranceMonths: intOption(values.tolerance, 'tolerance', 0, 60) ?? user.experienceToleranceMonths,
-  });
+  const settings = applySettingsFrom(
+    env,
+    {
+      ...scopeFrom(values, loadJobProfiles()),
+      experienceYears: values.experience === undefined ? user.experienceYears : Number(values.experience),
+      toleranceMonths: intOption(values.tolerance, 'tolerance', 0, 60) ?? user.experienceToleranceMonths,
+    },
+    values['auto-apply'] || env.AUTO_APPLY,
+  );
   if (!settings.locations?.length) settings.locations = matchProfile(user).preferredLocations;
   settings.limit = intOption(values.max, 'max', 1, 1_000_000) ?? null;
   settings.minMatchScore = intOption(values['min-score'], 'min-score', 0, 100) ?? settings.minMatchScore;
   settings.search = !values['skip-search'];
-  if (values['auto-apply']) settings.autoApply = true;
   printTable([
     ['Profiles', settings.profiles.join(', ') || 'all'],
     ['Locations', settings.locations.join(', ') || 'anywhere'],

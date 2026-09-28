@@ -176,7 +176,6 @@ export function createApi({ control, db, env, dirs = DEFAULT_DIRS }: { control: 
       ready: Boolean(loaded),
       problems,
       defaults: {
-        autoApply: env.AUTO_APPLY,
         locations: p ? matchProfile(p).preferredLocations : [],
         experienceYears: p?.experienceYears ?? null,
         toleranceMonths: p?.experienceToleranceMonths ?? 6,
@@ -297,6 +296,7 @@ export function createApi({ control, db, env, dirs = DEFAULT_DIRS }: { control: 
 
       case 'POST /api/runs/start': {
         const { scope, autoApply } = parse(startSchema, await readJson(req));
+        log.info(`Start from the dashboard with auto apply ${autoApply ? 'ON' : 'OFF'}`);
         return send(res, 202, { runId: await control.startAutoApply({ ...scope, autoApply }) });
       }
       case 'GET /api/runs': {

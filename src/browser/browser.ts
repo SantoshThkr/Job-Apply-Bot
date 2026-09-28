@@ -1,8 +1,9 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { chromium, type BrowserContext, type Page } from 'playwright';
 import { ROOT, paths, type Env } from '../config.ts';
 import { log } from '../logger.ts';
+import { APPLY_SELECTORS } from './selectors.ts';
 
 export async function launchBrowser({
   headless,
@@ -64,13 +65,30 @@ export async function saveDebugScreenshot(page: Page, label: string): Promise<vo
   }
 }
 
-// One screenshot per application step (DEBUG_SCREENSHOTS=true), grouped by run in data/debug/<run id>/.
+// One screenshot and the page's HTML per application step (DEBUG_SCREENSHOTS=true), grouped by run in
+// data/debug/<run id>/, so a step Naukri handled differently can be fixed from what it really showed.
 export async function saveStepScreenshot(page: Page, runId: string, label: string): Promise<void> {
   try {
     const dir = join(paths.debug, runId);
     mkdirSync(dir, { recursive: true });
-    await page.screenshot({ path: join(dir, `${label.replace(/[^\w.-]+/g, '-')}.png`) });
+    const file = join(dir, label.replace(/[^\w.-]+/g, '-'));
+    // The apply controls sit below the fold in a normal window; show them rather than the page header.
+    const { applyButton, appliedMarker, companySiteButton } = APPLY_SELECTORS;
+    await page.locator([applyButton, appliedMarker, companySiteButton].join(', ')).first().scrollIntoViewIfNeeded({ timeout: 1_000 }).catch(() => {});
+    await page.screenshot({ path: `${file}.png` });
+    writeFileSync(`${file}.html`, await page.content());
   } catch (err) {
     log.debug(`Could not save screenshot: ${(err as Error).message}`);
+  }
+}
+
+// Data behind a step (DEBUG_SCREENSHOTS=true), next to its screenshot in data/debug/<run id>/.
+export function saveStepData(runId: string, label: string, data: unknown): void {
+  try {
+    const dir = join(paths.debug, runId);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${label.replace(/[^\w.-]+/g, '-')}.json`), JSON.stringify(data, null, 2));
+  } catch (err) {
+    log.debug(`Could not save step data: ${(err as Error).message}`);
   }
 }

@@ -15,7 +15,8 @@ import {
   type Question,
   type Reply,
 } from '../browser/apply.ts';
-import { saveStepScreenshot } from '../browser/browser.ts';
+import { saveStepData, saveStepScreenshot } from '../browser/browser.ts';
+import { APPLY_SELECTORS } from '../browser/selectors.ts';
 import { postingDetails } from '../browser/job-details.ts';
 import { RunStopped } from '../browser/session.ts';
 import type { Answer } from '../config.ts';
@@ -77,6 +78,10 @@ export async function applyToJobs(ctx: ApplyContext, queue: QueueItem[], stats: 
     const attempt = new Attempt(ctx, job, index + 1, jobs.length, jobs[index + 1]);
     const status = await attempt.run();
     await closeOtherTabs(ctx.page);
+    if (attempt.dailyLimitReached !== null) {
+      const limit = attempt.dailyLimitReached ? `daily limit of ${attempt.dailyLimitReached} applications` : 'daily application limit';
+      throw new RunStopped(`Naukri's ${limit} is reached. Start again tomorrow; the queue picks up where it left off.`, 'DAILY_LIMIT');
+    }
     clickedLast = attempt.clicked;
     stats.processed = index + 1;
     unverified = status === 'NEEDS_REVIEW' && attempt.possiblySent ? unverified + 1 : 0;
@@ -147,6 +152,10 @@ class Attempt {
   get clicked(): boolean {
     return this.#state.applyClicked;
   }
+
+  // Naukri's daily allowance (0 when it didn't say) once this attempt used up the last of it or was
+  // refused for it; null otherwise.
+  dailyLimitReached: number | null = null;
 
   // Apply was clicked without a form opening, or a submit was clicked: Naukri may have the application.
   get possiblySent(): boolean {
@@ -226,9 +235,15 @@ class Attempt {
       return this.#finish('READY_TO_APPLY', { code: 'RUN_STOPPED', reason: 'Run stopped before Apply was clicked; nothing was sent' });
     }
 
+    log.info(`AUTO APPLY: clicking Apply for ${job.company} — ${job.title}`);
     const clicked = await clickApply(page, this.#waits);
     this.#update({ status: 'APPLY_CLICKED', applyClicked: true });
-    this.#event('APPLY_CLICKED', 'Apply clicked');
+    const calls = clicked.calls.map((call) => `${call.api} ${call.status}`);
+    if (clicked.quota && clicked.quota.dailyApplied >= clicked.quota.dailyQuota) this.dailyLimitReached = clicked.quota.dailyQuota;
+    if (clicked.kind === 'ERROR' && APPLY_SELECTORS.limitText.test(clicked.evidence)) this.dailyLimitReached = clicked.quota?.dailyQuota ?? 0;
+    this.#event('APPLY_CLICKED', 'Apply clicked', { detail: { naukriResponse: clicked.kind, naukriCalls: calls } });
+    await this.#screenshot('after-apply-click');
+    if (settings.debugScreenshots) saveStepData(this.#ctx.runId, `${this.#position}-${job.company}-naukri-calls`, clicked.calls);
 
     let evidence: string | null = null;
     switch (clicked.kind) {
@@ -243,6 +258,12 @@ class Attempt {
       case 'ERROR':
         await this.#screenshot('failure');
         return this.#finish('FAILED', { code: 'SUBMIT_ERROR', reason: clicked.evidence });
+      case 'QUESTIONS_UNREADABLE':
+        await this.#formOpened('Recruiter questions opened');
+        return this.#finish('NEEDS_REVIEW', {
+          code: 'UNSUPPORTED_FIELD',
+          reason: "Naukri opened its recruiter questions, but the bot couldn't read them; nothing was sent",
+        });
       case 'QUESTIONNAIRE': {
         await this.#formOpened('Recruiter questions opened');
         const answered = await this.#answerQuestions();
@@ -297,11 +318,20 @@ class Attempt {
       markJobApplied(db, job.jobId);
       const status = this.#finish('APPLIED', { message: `Application confirmed: ${evidence}`, changes: { successConfirmed: true } });
       db.exec('COMMIT');
+      await this.#appliedCheck();
       return status;
     } catch (err) {
       db.exec('ROLLBACK');
       throw err;
     }
+  }
+
+  // Debug evidence only: the job page as Naukri shows it once the application is in.
+  async #appliedCheck(): Promise<void> {
+    if (!this.#ctx.settings.debugScreenshots) return;
+    const state = await openJobPage(this.#ctx.page, this.#job.url, this.#waits).catch(() => null);
+    log.info(`${this.#job.company} → job page after applying shows: ${state?.kind ?? 'nothing readable'}`);
+    await this.#screenshot('applied-check');
   }
 
   async #formOpened(message: string): Promise<void> {

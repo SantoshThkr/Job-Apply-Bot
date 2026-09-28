@@ -109,6 +109,8 @@ describe('matchingProfiles', () => {
     expect(profilesOf('Java + Angular (3-9 YRS) @ Infosys')).toEqual([]);
     expect(profilesOf('Java Full Stack Developer (Spring Boot + React/Angular)')).toEqual(['fullstack']);
     expect(profilesOf('.NET REACT @ Infosys')).toEqual([]);
+    expect(profilesOf('Lead Engineer - Python+ React + Kiro')).toEqual(['broad']);
+    expect(profilesOf('C++ Developer')).toEqual([]);
     expect(profilesOf('Python Fullstack Developer (Python, Fast Api, React.JS & AWS)')).toEqual(['fullstack', 'broad']);
     expect(profilesOf('Senior Frontend Engineer : React / Next.js')).toEqual(['frontend', 'react', 'fullstack', 'broad']);
   });

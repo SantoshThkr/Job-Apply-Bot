@@ -234,11 +234,12 @@ export function runApplications(
   });
 }
 
-export function applySettingsFrom(env: Env, scope: JobScope = { profiles: [], freshness: 'all' }): ApplySettings {
+// `autoApply` always comes from whoever starts the run: the dashboard's switch, or the CLI's flag.
+export function applySettingsFrom(env: Env, scope: JobScope, autoApply: boolean): ApplySettings {
   return {
     ...scope,
     minMatchScore: env.MIN_MATCH_SCORE,
-    autoApply: env.AUTO_APPLY,
+    autoApply,
     autoFill: env.AUTO_FILL,
     delaySeconds: Math.round(env.APPLY_DELAY_MS / 1_000),
     debugScreenshots: env.DEBUG_SCREENSHOTS,

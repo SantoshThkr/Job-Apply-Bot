@@ -292,6 +292,57 @@ describe('applying to Naukri jobs (fake pages)', () => {
     expect(fake.clicks.size).toBe(1);
   });
 
+  it('finds Naukri\'s Apply and company-site buttons by name when the ids are missing, and never clicks Save', async () => {
+    addJob('100000000001', 92, 'Named Co');
+    addJob('100000000002', 91, 'Named Site Co');
+    const fake = await applyAll([
+      { id: '100000000001', kind: 'named-buttons' },
+      { id: '100000000002', kind: 'named-external' },
+    ]);
+    expect(outcomes()).toMatchObject({
+      'Named Co': { status: 'APPLIED', clicked: true, confirmed: true },
+      'Named Site Co': { status: 'EXTERNAL', clicked: false },
+    });
+    expect([...fake.clicks.keys()]).toEqual(['100000000001']);
+    expect(fake.saves.size).toBe(0);
+  });
+
+  it('confirms when Naukri turns the Apply button into Applied, and records the calls it made', async () => {
+    addJob('100000000001', 92, 'Flip Co');
+    await applyAll([{ id: '100000000001', kind: 'in-place' }]);
+    expect(outcomes()['Flip Co']).toEqual({ status: 'APPLIED', code: null, clicked: true, submitted: true, confirmed: true });
+  });
+
+  it('sends a question chat it cannot read to review, without calling it sent', async () => {
+    addJob('100000000001', 92, 'Chat Co');
+    addJob('100000000002', 91, 'Next Co');
+    const fake = await applyAll([
+      { id: '100000000001', kind: 'chat-unknown-markup' },
+      { id: '100000000002', kind: 'one-click' },
+    ]);
+    expect(outcomes()).toMatchObject({
+      'Chat Co': { status: 'NEEDS_REVIEW', code: 'UNSUPPORTED_FIELD', clicked: true, submitted: false, confirmed: false },
+      // The run carries on to the next job by itself.
+      'Next Co': { status: 'APPLIED' },
+    });
+    const chat = listApplications(db, { runId: 'RUN-TEST' }).find((a) => a.company === 'Chat Co')!;
+    expect(chat.formOpened).toBe(true);
+    const clicked = runEvents(db, { applicationId: chat.id }).find((e) => e.type === 'APPLY_CLICKED');
+    expect(clicked?.detail).toEqual({ naukriResponse: 'QUESTIONS_UNREADABLE', naukriCalls: ['chatbot 200'] });
+    // Not possibly sent, so it is not counted as an unconfirmed submission either.
+    expect(queueFor(settings).map((job) => job.company)).toEqual([]);
+    expect(fake.clicks.size).toBe(2);
+  }, 60_000);
+
+  it('confirms from Naukri\'s reply to the apply call, in its own words', async () => {
+    addJob('100000000001', 92, 'Api Co');
+    await applyAll([{ id: '100000000001', kind: 'api-success' }]);
+    expect(outcomes()['Api Co']).toEqual({ status: 'APPLIED', code: null, clicked: true, submitted: true, confirmed: true });
+    const events = runEvents(db, { applicationId: listApplications(db, { runId: 'RUN-TEST' })[0]!.id });
+    expect(events.find((e) => e.type === 'APPLICATION_CONFIRMED')?.message).toBe('Application confirmed: Naukri: "You have successfully applied to this job."');
+    expect(events.find((e) => e.type === 'APPLY_CLICKED')?.detail).toEqual({ naukriResponse: 'CONFIRMED', naukriCalls: ['apply 200'] });
+  });
+
   it('leaves jobs the search already knows are external out of the queue', () => {
     const jobId = addJob('100000000001', 95, 'Site Co');
     db.prepare('UPDATE jobs SET external_apply = 1 WHERE id = ?').run(jobId);
@@ -382,6 +433,33 @@ describe('application runs', () => {
     expect(run.outcomes).toMatchObject({ applied: 1, failed: 1 });
     expect(outcomes(run.id)).toMatchObject({ First: { status: 'APPLIED' }, Blocked: { status: 'SECURITY_CHALLENGE', code: 'SECURITY_CHALLENGE' } });
     expect(outcomes(run.id).Never).toBeUndefined();
+  });
+
+  it('stops the run once Naukri\'s daily limit is used up, and when Naukri refuses for it', async () => {
+    addJob('100000000001', 95, 'Last Of Today', { hoursAgo: 1 });
+    addJob('100000000002', 90, 'Tomorrow', { hoursAgo: 2 });
+    const fake = await serveFakeNaukri(
+      context,
+      [
+        { id: '100000000001', kind: 'api-success' },
+        { id: '100000000002', kind: 'api-success' },
+      ],
+      { dailyApplied: 49, dailyQuota: 50 },
+    );
+    const run = await runApplications(page, db, env, settings, options()).done;
+    expect(run).toMatchObject({ status: 'STOPPED', stopCode: 'DAILY_LIMIT', attempted: 1, outcomes: { applied: 1 } });
+    expect(run.stopReason).toMatch(/daily limit of 50 applications is reached/);
+    expect(fake.clicks.get('100000000002')).toBeUndefined();
+
+    // Refused outright: the job fails with Naukri's words, and the run stops rather than try the rest.
+    addJob('100000000003', 88, 'Refused', { hoursAgo: 1 });
+    await serveFakeNaukri(context, [
+      { id: '100000000003', kind: 'api-limit' },
+      { id: '100000000002', kind: 'api-success' },
+    ]);
+    const refused = await runApplications(page, db, env, settings, options()).done;
+    expect(refused).toMatchObject({ status: 'STOPPED', stopCode: 'DAILY_LIMIT', attempted: 1, outcomes: { failed: 1 } });
+    expect(outcomes(refused.id).Refused).toMatchObject({ status: 'FAILED', code: 'SUBMIT_ERROR' });
   });
 
   it('refuses to start when the Naukri session is gone', async () => {

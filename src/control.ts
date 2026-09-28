@@ -167,7 +167,7 @@ export class BotControl {
     })();
   }
 
-  async #startRun(kind: RunKind, start: (page: Page | null, signal: AbortSignal) => TrackedRun): Promise<string> {
+  async #startRun(kind: RunKind, start: (page: Page | null, signal: AbortSignal) => TrackedRun, { autoApply = false } = {}): Promise<string> {
     this.#begin(kind);
     let tracked: TrackedRun;
     const abort = new AbortController();
@@ -179,7 +179,7 @@ export class BotControl {
       throw err;
     }
     this.#abort = abort;
-    this.#set({ activeRun: { id: tracked.runId, kind, startedAt: new Date().toISOString(), paused: false, stopRequested: false } });
+    this.#set({ activeRun: { id: tracked.runId, kind, startedAt: new Date().toISOString(), autoApply, paused: false, stopRequested: false } });
     this.#running = tracked.done.then((run) => {
       const session = run.stopCode && SESSION_AFTER_STOP[run.stopCode];
       if (session) this.#setSession(session);
@@ -203,16 +203,21 @@ export class BotControl {
     const unknown = request.profiles.filter((id) => !this.jobProfiles().some((p) => p.id === id));
     if (unknown.length) throw new ConfigError(`Unknown job profile: ${unknown.join(', ')}`);
     if (request.freshness === 'custom' && !request.from) throw new ConfigError('Pick a start date for the custom range');
-    const settings = { ...applySettingsFrom(this.#env, request), autoApply: request.autoApply };
-    return this.#startRun('APPLY', (page, signal) =>
-      runApplications(page!, this.#db, this.#env, settings, {
-        signal,
-        whilePaused: () => this.#paused?.promise ?? Promise.resolve(),
-        browseDelayMs: [this.#env.DELAY_MIN_MS, this.#env.DELAY_MAX_MS],
-        dirs: this.#dirs,
-        waitMs: this.#waitMs,
-        provider: createProvider(this.#env),
-      }),
+    const { autoApply, ...scope } = request;
+    const settings = applySettingsFrom(this.#env, scope, autoApply);
+    log.info(`Auto apply ${settings.autoApply ? 'ON: eligible jobs will be applied to' : 'OFF: jobs are checked, Apply is not clicked'}`);
+    return this.#startRun(
+      'APPLY',
+      (page, signal) =>
+        runApplications(page!, this.#db, this.#env, settings, {
+          signal,
+          whilePaused: () => this.#paused?.promise ?? Promise.resolve(),
+          browseDelayMs: [this.#env.DELAY_MIN_MS, this.#env.DELAY_MAX_MS],
+          dirs: this.#dirs,
+          waitMs: this.#waitMs,
+          provider: createProvider(this.#env),
+        }),
+      { autoApply: settings.autoApply },
     );
   }
 

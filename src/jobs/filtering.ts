@@ -65,9 +65,11 @@ const TITLE_SYNONYMS: Record<string, string[]> = {
   'next js': ['nextjs'],
 };
 
+// "C++" and "C#" stay whole; a lone "+" joins two words ("Python+ React"), so it separates them.
 const words = (text: string) =>
   text
     .toLowerCase()
+    .replace(/(?<!\+)\+(?!\+)/g, ' ')
     .replace(/[^a-z0-9+#]+/g, ' ')
     .trim();
 

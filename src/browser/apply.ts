@@ -12,7 +12,18 @@ export type JobPageState =
 
 const jobApiSchema = z.object({ jobDetails: z.object({ applyRedirectUrl: z.string().optional() }) });
 
-const visible = (page: Page, selector: string) => page.locator(selector).filter({ visible: true }).count().then((n) => n > 0);
+const shown = (locator: Locator) => locator.count().then((n) => n > 0);
+
+// Naukri's own Apply button: its id, or a visible button named just "Apply" or "Apply now".
+function applyControl(page: Page): Locator {
+  const { applyButton, applyButtonName } = APPLY_SELECTORS;
+  return page.locator(applyButton).or(page.getByRole('button', { name: applyButtonName })).filter({ visible: true }).first();
+}
+
+function companySiteControl(page: Page): Locator {
+  const { companySiteButton, companySiteButtonName } = APPLY_SELECTORS;
+  return page.locator(companySiteButton).or(page.getByRole('button', { name: companySiteButtonName })).filter({ visible: true }).first();
+}
 
 async function goto(page: Page, url: string): Promise<void> {
   try {
@@ -44,20 +55,16 @@ export async function openJobPage(page: Page, url: string, { waitMs = 15_000 } =
 }
 
 async function readApplyControls(page: Page, waitMs: number, api: () => Promise<unknown>): Promise<JobPageState> {
-  const { appliedMarker, applyButton, companySiteButton, unavailableText } = APPLY_SELECTORS;
-  await page
-    .locator([appliedMarker, applyButton, companySiteButton].join(', '))
-    .filter({ visible: true })
-    .first()
-    .waitFor({ timeout: waitMs })
-    .catch(() => {});
+  const { appliedMarker, unavailableText } = APPLY_SELECTORS;
+  const applied = page.locator(appliedMarker).filter({ visible: true }).first();
+  await applied.or(companySiteControl(page)).or(applyControl(page)).first().waitFor({ timeout: waitMs }).catch(() => {});
 
-  if (await visible(page, appliedMarker)) return { kind: 'ALREADY_APPLIED' };
-  if (await visible(page, companySiteButton)) {
+  if (await shown(applied)) return { kind: 'ALREADY_APPLIED' };
+  if (await shown(companySiteControl(page))) {
     const details = jobApiSchema.safeParse(await api());
     return { kind: 'EXTERNAL', externalUrl: (details.success && details.data.jobDetails.applyRedirectUrl) || null };
   }
-  if (await visible(page, applyButton)) return { kind: 'CAN_APPLY' };
+  if (await shown(applyControl(page))) return { kind: 'CAN_APPLY' };
 
   await assertUsable(page);
   const text = await page.locator('body').innerText({ timeout: 2_000 }).catch(() => '');
@@ -67,7 +74,7 @@ async function readApplyControls(page: Page, waitMs: number, api: () => Promise<
 
 // Evidence that Naukri accepted an application, in its own words, or null.
 export async function successEvidence(page: Page): Promise<string | null> {
-  if (new URL(page.url()).pathname.startsWith(APPLY_SELECTORS.successPath)) return 'Naukri opened its application confirmation page';
+  if (APPLY_SELECTORS.successPath.test(new URL(page.url()).pathname)) return 'Naukri opened its application confirmation page';
   const text = await page.locator('body').innerText({ timeout: 1_000 }).catch(() => '');
   const match = text.match(APPLY_SELECTORS.successText);
   return match ? `Naukri showed "${match[0]}"` : null;
@@ -80,13 +87,50 @@ export async function errorEvidence(page: Page): Promise<string | null> {
   return match ? `Naukri showed "${match[0]}"` : null;
 }
 
-export type ApplyClickResult =
+type ClickOutcome =
   | { kind: 'CONFIRMED'; evidence: string }
   | { kind: 'QUESTIONNAIRE' }
+  // Naukri's question chat answered, but its drawer isn't one the bot can read. Nothing was sent.
+  | { kind: 'QUESTIONS_UNREADABLE' }
   | { kind: 'FORM' }
   | { kind: 'EXTERNAL'; url: string }
   | { kind: 'ERROR'; evidence: string }
   | { kind: 'NO_RESPONSE' };
+
+// Naukri's daily allowance, from its reply to the Apply click.
+export interface ApplyQuota {
+  dailyApplied: number;
+  dailyQuota: number;
+}
+
+export type ApplyClickResult = ClickOutcome & { calls: NaukriCall[]; quota: ApplyQuota | null };
+
+// The apply call's reply, as seen on a live application (2026-09-26):
+// { jobs: [{ status: 200, message: "You have successfully applied to this job." }], quotaDetails: { dailyApplied, dailyQuota, ... } }
+const applyReplySchema = z.object({
+  jobs: z.array(z.object({ status: z.number(), message: z.string().default('') })).default([]),
+  quotaDetails: z.object({ dailyApplied: z.number(), dailyQuota: z.number() }).optional(),
+});
+
+function readApplyReply(calls: NaukriCall[]): { status: number; message: string; at: number; quota: ApplyQuota | null } | null {
+  const call = calls.findLast((c) => c.api === 'apply');
+  if (!call) return null;
+  try {
+    const reply = applyReplySchema.parse(JSON.parse(call.body));
+    const job = reply.jobs[0];
+    return { status: job?.status ?? call.status, message: job?.message ?? '', at: call.at, quota: reply.quotaDetails ?? null };
+  } catch {
+    return { status: call.status, message: '', at: call.at, quota: null };
+  }
+}
+
+// A Naukri API call the page made after the click, for the attempt's record.
+export interface NaukriCall {
+  api: 'apply' | 'chatbot';
+  status: number;
+  body: string;
+  at: number;
+}
 
 const questionnaire = (page: Page) => page.locator(APPLY_SELECTORS.questionnaire).filter({ visible: true }).first();
 const applyForm = (page: Page) => page.locator(APPLY_SELECTORS.applyForm).filter({ visible: true }).last();
@@ -98,31 +142,60 @@ export async function clickApply(page: Page, { waitMs = 20_000 } = {}): Promise<
   const onPage = (tab: Page) => {
     opened = tab;
   };
+  const calls: NaukriCall[] = [];
+  const onResponse = (res: Response) => {
+    const api = APPLY_SELECTORS.applyApi.test(res.url()) ? 'apply' : APPLY_SELECTORS.chatbotApi.test(res.url()) ? 'chatbot' : null;
+    if (!api) return;
+    const record = (body: string) => calls.push({ api, status: res.status(), body, at: Date.now() });
+    res.text().then(record, () => record(''));
+  };
+  const applied = page.locator(APPLY_SELECTORS.appliedMarker).filter({ visible: true });
   page.context().on('page', onPage);
+  page.on('response', onResponse);
   try {
     const formsBefore = await page.locator(APPLY_SELECTORS.applyForm).filter({ visible: true }).count();
-    await page.locator(APPLY_SELECTORS.applyButton).filter({ visible: true }).first().click();
+    // Playwright waits for the button to be visible, enabled and steady before clicking.
+    await applyControl(page).click();
     const deadline = Date.now() + waitMs;
-    while (Date.now() < deadline) {
-      if (await detectChallenge(page)) await assertUsable(page);
-      const evidence = await successEvidence(page);
-      if (evidence) return { kind: 'CONFIRMED', evidence };
-      if (await questionnaire(page).count()) return { kind: 'QUESTIONNAIRE' };
-      if ((await page.locator(APPLY_SELECTORS.applyForm).filter({ visible: true }).count()) > formsBefore) return { kind: 'FORM' };
-      const error = await errorEvidence(page);
-      if (error) return { kind: 'ERROR', evidence: error };
-      if (opened) {
-        await opened.waitForLoadState('domcontentloaded').catch(() => {});
-        const url = opened.url();
-        // The bot never continues on another company's site.
-        await opened.close().catch(() => {});
-        return { kind: 'EXTERNAL', url };
+    // Naukri's reason when its reply refused the application and no recruiter questions followed.
+    const refusal = () => {
+      const reply = readApplyReply(calls);
+      return reply && reply.status !== 200 && reply.message && !calls.some((c) => c.api === 'chatbot') ? reply.message : null;
+    };
+    const result = async (): Promise<ClickOutcome> => {
+      while (Date.now() < deadline) {
+        if (await detectChallenge(page)) await assertUsable(page);
+        // Naukri's own reply to the click is the surest word on how it went.
+        const reply = readApplyReply(calls);
+        if (reply?.status === 200 && APPLY_SELECTORS.successText.test(reply.message)) return { kind: 'CONFIRMED', evidence: `Naukri: "${reply.message}"` };
+        const evidence = await successEvidence(page);
+        if (evidence) return { kind: 'CONFIRMED', evidence };
+        // Naukri swaps the Apply button for "Applied" once the application is in.
+        if (await shown(applied)) return { kind: 'CONFIRMED', evidence: 'Naukri now shows the job as Applied' };
+        if (await questionnaire(page).count()) return { kind: 'QUESTIONNAIRE' };
+        if ((await page.locator(APPLY_SELECTORS.applyForm).filter({ visible: true }).count()) > formsBefore) return { kind: 'FORM' };
+        const error = await errorEvidence(page);
+        if (error) return { kind: 'ERROR', evidence: error };
+        // A refusal with a reason, and no recruiter questions coming up after it.
+        if (refusal() && Date.now() - reply!.at > 1_500) return { kind: 'ERROR', evidence: `Naukri: "${reply!.message}"` };
+        if (opened) {
+          await opened.waitForLoadState('domcontentloaded').catch(() => {});
+          const url = opened.url();
+          // The bot never continues on another company's site.
+          await opened.close().catch(() => {});
+          return { kind: 'EXTERNAL', url };
+        }
+        await page.waitForTimeout(500);
       }
-      await page.waitForTimeout(500);
-    }
-    return { kind: 'NO_RESPONSE' };
+      const refused = refusal();
+      if (refused) return { kind: 'ERROR', evidence: `Naukri: "${refused}"` };
+      return { kind: calls.some((call) => call.api === 'chatbot') ? 'QUESTIONS_UNREADABLE' : 'NO_RESPONSE' };
+    };
+    const outcome = await result();
+    return { ...outcome, calls, quota: readApplyReply(calls)?.quota ?? null };
   } finally {
     page.context().off('page', onPage);
+    page.off('response', onResponse);
   }
 }
 

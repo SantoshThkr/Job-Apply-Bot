@@ -5,6 +5,8 @@ import { createContext, useCallback, useContext, useEffect, useState, type React
 import { useApi } from './api';
 
 const KEY = 'job-bot:settings';
+// Kept apart from the other settings: an earlier version saved the server's default (off) there.
+const AUTO_APPLY_KEY = 'job-bot:auto-apply';
 
 export interface RunSettings extends Required<JobScope> {
   autoApply: boolean;
@@ -18,7 +20,8 @@ const DEFAULT: RunSettings = {
   to: null,
   experienceYears: null,
   toleranceMonths: 6,
-  autoApply: false,
+  // The dashboard's purpose is applying; the switch turns it off for a check-only run.
+  autoApply: true,
 };
 
 interface Settings {
@@ -30,12 +33,15 @@ interface Settings {
 
 const SettingsContext = createContext<Settings>({ settings: DEFAULT, setSettings: () => {}, profile: undefined, reloadProfile: () => {} });
 
-function saved(): Partial<RunSettings> | null {
+function saved(): Partial<RunSettings> {
   try {
     const value = JSON.parse(localStorage.getItem(KEY) ?? 'null') as Partial<RunSettings> | null;
-    return value && Array.isArray(value.profiles) && FRESHNESS.includes(value.freshness!) ? value : null;
+    const autoApply = JSON.parse(localStorage.getItem(AUTO_APPLY_KEY) ?? 'null') as unknown;
+    const settings = value && Array.isArray(value.profiles) && FRESHNESS.includes(value.freshness!) ? { ...value } : {};
+    delete settings.autoApply;
+    return typeof autoApply === 'boolean' ? { ...settings, autoApply } : settings;
   } catch {
-    return null;
+    return {};
   }
 }
 
@@ -49,7 +55,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     if (!profile && !error) return;
     const defaults = profile?.defaults;
     setState((current) => {
-      const fromProfile = defaults && { autoApply: defaults.autoApply, toleranceMonths: defaults.toleranceMonths };
+      const fromProfile = defaults && { toleranceMonths: defaults.toleranceMonths };
       const base = current === DEFAULT ? { ...DEFAULT, ...fromProfile, ...saved() } : current;
       return {
         ...base,
@@ -63,7 +69,9 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     setState((current) => {
       const next = { ...current, ...patch };
       try {
-        localStorage.setItem(KEY, JSON.stringify(next));
+        const { autoApply, ...rest } = next;
+        localStorage.setItem(KEY, JSON.stringify(rest));
+        localStorage.setItem(AUTO_APPLY_KEY, JSON.stringify(autoApply));
       } catch {
         // Remembering the choice is a convenience only.
       }

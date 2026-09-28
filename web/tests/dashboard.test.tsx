@@ -44,7 +44,7 @@ const idle: BotState = { session: 'LOGGED_IN', sessionCheckedAt: at, browser: 'R
 const applying: BotState = {
   ...idle,
   activity: 'APPLY',
-  activeRun: { id: 'RUN-20260925-134500', kind: 'APPLY', startedAt: at, paused: false, stopRequested: false },
+  activeRun: { id: 'RUN-20260925-134500', kind: 'APPLY', startedAt: at, autoApply: true, paused: false, stopRequested: false },
 };
 const runEvent = (type: RunEvent['type'], message: string, extra: Partial<RunEvent> = {}): RunEvent => ({
   type,
@@ -94,7 +94,7 @@ const profile: ProfileResponse = {
   source: 'data',
   ready: true,
   problems: [],
-  defaults: { autoApply: false, locations: ['Bangalore'], experienceYears: 7, toleranceMonths: 6 },
+  defaults: { locations: ['Bangalore'], experienceYears: 7, toleranceMonths: 6 },
 };
 
 const application = (overrides: Partial<ApplicationRow>): ApplicationRow => ({
@@ -260,7 +260,7 @@ describe('apply page', () => {
     await waitFor(() => expect(calls('POST /api/runs/start')).toHaveLength(1));
     expect(JSON.parse(calls('POST /api/runs/start')[0]![1]!.body as string)).toEqual({
       scope: { profiles: ['react'], locations: ['Bangalore', 'Remote'], freshness: 'custom', from: '2026-09-20', to: '2026-09-25', experienceYears: 8, toleranceMonths: 3 },
-      autoApply: false,
+      autoApply: true,
     });
   });
 
@@ -271,15 +271,39 @@ describe('apply page', () => {
     expect((screen.getByRole('button', { name: 'Start auto apply' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it('asks before turning auto apply on', async () => {
-    const confirm = vi.fn(() => false);
-    vi.stubGlobal('confirm', confirm);
+  it('starts with auto apply on unless the switch is turned off, and never takes an old saved off', async () => {
+    responses['POST /api/runs/start'] = { runId: 'RUN-20260925-134500' };
+    // What an earlier version saved: the server's default, off, inside the other settings.
+    localStorage.setItem('job-bot:settings', JSON.stringify({ profiles: [], locations: [], freshness: '24h', autoApply: false }));
     withProviders(<ApplyPage />);
-    const toggle = await screen.findByRole('switch');
-    await waitFor(() => expect((toggle as HTMLInputElement).checked).toBe(false));
+    emit({ type: 'STATE', state: idle, timestamp: at });
+    const toggle = (await screen.findByRole('switch')) as HTMLInputElement;
+    await waitFor(() => expect(toggle.checked).toBe(true));
+    expect(screen.getByText('ON')).toBeTruthy();
+
     fireEvent.click(toggle);
-    expect(confirm).toHaveBeenCalled();
-    expect((toggle as HTMLInputElement).checked).toBe(false);
+    expect(toggle.checked).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Start (check only)' }));
+    await waitFor(() => expect(calls('POST /api/runs/start')).toHaveLength(1));
+    expect(JSON.parse(calls('POST /api/runs/start')[0]![1]!.body as string)).toMatchObject({ autoApply: false });
+    expect(localStorage.getItem('job-bot:auto-apply')).toBe('false');
+
+    fireEvent.click(toggle);
+    expect(toggle.checked).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Start auto apply' }));
+    await waitFor(() => expect(calls('POST /api/runs/start')).toHaveLength(2));
+    expect(JSON.parse(calls('POST /api/runs/start')[1]![1]!.body as string)).toMatchObject({ autoApply: true });
+    expect(localStorage.getItem('job-bot:auto-apply')).toBe('true');
+  });
+
+  it('shows whether the active run applies or only checks', () => {
+    withProviders(<CurrentRun />);
+    emit({ type: 'STATE', state: applying, timestamp: at }, runEvent('JOB_STARTED', 'Started 1/2', { detail: { position: 1, total: 2 } }));
+    expect(screen.getByText('Auto apply ON')).toBeTruthy();
+    expect(screen.getByText('Applying…')).toBeTruthy();
+    emit({ type: 'STATE', state: { ...applying, activeRun: { ...applying.activeRun!, autoApply: false } }, timestamp: at });
+    expect(screen.getByText('Auto apply OFF: checking jobs, not applying')).toBeTruthy();
+    expect(screen.getByText('Checking…')).toBeTruthy();
   });
 
   it('pauses, resumes and stops the active run', async () => {

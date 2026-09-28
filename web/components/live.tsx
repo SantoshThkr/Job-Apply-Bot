@@ -39,6 +39,11 @@ export function CurrentRun() {
     : active.paused
       ? 'Paused. Nothing is clicked until you resume.'
       : null;
+  const mode = (
+    <p className={`text-xs font-semibold uppercase tracking-wide ${active.autoApply ? 'text-emerald-700' : 'text-slate-500'}`}>
+      {active.autoApply ? 'Auto apply ON' : 'Auto apply OFF: checking jobs, not applying'}
+    </p>
+  );
   const searched = run.findLast((e) => e.type === 'SEARCH_FINISHED');
   const queued = run.findLast((e) => e.type === 'QUEUE_READY');
   const start = run.findLast((e) => e.type === 'JOB_STARTED');
@@ -47,8 +52,11 @@ export function CurrentRun() {
     const lastLine = log.findLast((line) => line.runId === active.id)?.message;
     return (
       <div className="space-y-1 text-sm" aria-live="polite">
+        {mode}
         {queued ? (
-          <p className="font-medium">{queued.message}. Applying automatically…</p>
+          <p className="font-medium">
+            {queued.message}. {active.autoApply ? 'Applying automatically…' : 'Checking each job…'}
+          </p>
         ) : searched ? (
           <p className="font-medium">{searched.message}. Filtering…</p>
         ) : (
@@ -69,6 +77,7 @@ export function CurrentRun() {
   const { position, total, nextCompany, nextTitle } = start.detail ?? {};
   return (
     <div className="space-y-3">
+      {mode}
       <p className="text-2xl font-semibold tabular-nums" aria-live="polite">
         {String(position)} / {String(total)}
       </p>
@@ -86,7 +95,7 @@ export function CurrentRun() {
           <StatusBadge status={final.status} />
         </p>
       ) : (
-        <p className="text-sm text-sky-700">Applying…</p>
+        <p className="text-sm text-sky-700">{active.autoApply ? 'Applying…' : 'Checking…'}</p>
       )}
       {nextCompany && (
         <p className="text-xs text-slate-500">

@@ -22,7 +22,17 @@ export type FakeJobKind =
   | 'form-unknown'
   // Apply shows an error instead of applying.
   | 'error'
+  // Apply sends it and the button turns into "Applied", with no message.
+  | 'in-place'
+  // Only Naukri's reply to the apply call says how it went; the page shows nothing.
+  | 'api-success'
+  | 'api-limit'
+  // Apply opens the recruiter-question chat, drawn with markup the bot doesn't know.
+  | 'chat-unknown-markup'
   | 'external'
+  // The same as one-click and external, but without Naukri's button ids: only the button names say.
+  | 'named-buttons'
+  | 'named-external'
   | 'applied'
   | 'no-button'
   | 'expired'
@@ -116,13 +126,24 @@ const APPLY_SCRIPT = (id: string, kind: FakeJobKind, questions: FakeQuestion[]) 
       success();
     });
   }
-  document.querySelectorAll('#apply-button').forEach((button) => button.addEventListener('click', () => {
+  document.querySelectorAll('.save-job').forEach((button) => button.addEventListener('click', () => fetch('/fake/save/${id}', { method: 'POST' })));
+  document.querySelectorAll('#apply-button, .apply-now').forEach((button) => button.addEventListener('click', () => {
     fetch('/fake/click/${id}', { method: 'POST' });
-    if (${JSON.stringify(kind)} === 'one-click') success();
+    if (${JSON.stringify(kind)} === 'one-click' || ${JSON.stringify(kind)} === 'named-buttons') success();
     if (${JSON.stringify(kind)} === 'quiet') done();
     if (${JSON.stringify(kind)} === 'form') openForm(false);
     if (${JSON.stringify(kind)} === 'form-unknown') openForm(true);
     if (${JSON.stringify(kind)} === 'error') document.body.insertAdjacentHTML('beforeend', '<p>Something went wrong. Please try again.</p>');
+    if (${JSON.stringify(kind)} === 'api-success' || ${JSON.stringify(kind)} === 'api-limit') {
+      fetch('/cloudgateway-workflow/workflow-services/apply-workflow/v1/apply', { method: 'POST', body: JSON.stringify({ jobId: '${id}', kind: ${JSON.stringify(kind)} }) });
+    }
+    if (${JSON.stringify(kind)} === 'in-place') {
+      done().then(() => document.querySelectorAll('#apply-button').forEach((b) => b.outerHTML = '<span id="already-applied">Applied</span>'));
+    }
+    if (${JSON.stringify(kind)} === 'chat-unknown-markup') {
+      fetch('/cloudgateway-chatbot/chatbot-services/botapi/v5/respond', { method: 'POST', body: '{}' });
+      document.body.insertAdjacentHTML('beforeend', '<aside class="qna-panel"><p>What is your current CTC?</p><input></aside>');
+    }
     if (${JSON.stringify(kind)} !== 'questions') return;
     document.body.insertAdjacentHTML('beforeend', \`
       <div class="chatbot_DrawerContentWrapper">
@@ -155,6 +176,12 @@ function jobPage(job: FakeJob, applied: boolean): string {
       return `${header}${api}<div class="styles_jhc__apply-button-container__x"><span id="already-applied">Applied</span></div>`;
     case 'external':
       return `${header}${api}<div class="styles_jhc__apply-button-container__x"><button id="company-site-button">Apply on company site</button></div>`;
+    case 'named-external':
+      return `${header}${api}<div><button class="save-job">Save</button><button>Apply on company site</button></div>`;
+    case 'named-buttons':
+      if (applied) return `${header}${api}<div class="styles_jhc__apply-button-container__x"><span id="already-applied">Applied</span></div>`;
+      return `${header}${api}<div><button class="save-job">Save</button><button class="apply-now">Apply now</button></div>
+        ${APPLY_SCRIPT(job.id, job.kind, [])}`;
     case 'no-button':
       return `${header}${api}<p>Job description only</p>`;
     case 'expired':
@@ -171,6 +198,8 @@ function jobPage(job: FakeJob, applied: boolean): string {
 
 export interface FakeNaukri {
   clicks: Map<string, number>;
+  saves: Set<string>;
+  dailyApplied: number;
   answers: Map<string, string[]>;
   forms: Map<string, Record<string, string>>;
   applied: Set<string>;
@@ -180,9 +209,14 @@ export interface FakeNaukri {
 export async function serveFakeNaukri(
   context: BrowserContext,
   jobs: FakeJob[] | (() => FakeJob[]),
-  { loggedIn = true, search = [] }: { loggedIn?: boolean; search?: FakeCard[] | (() => FakeCard[]) } = {},
+  {
+    loggedIn = true,
+    search = [],
+    dailyApplied = 0,
+    dailyQuota = 50,
+  }: { loggedIn?: boolean; search?: FakeCard[] | (() => FakeCard[]); dailyApplied?: number; dailyQuota?: number } = {},
 ): Promise<FakeNaukri> {
-  const state: FakeNaukri = { clicks: new Map(), answers: new Map(), forms: new Map(), applied: new Set() };
+  const state: FakeNaukri = { clicks: new Map(), saves: new Set(), answers: new Map(), forms: new Map(), applied: new Set(), dailyApplied };
   const find = (id: string) => (typeof jobs === 'function' ? jobs() : jobs).find((job) => job.id === id);
   await context.unrouteAll();
   await context.route('https://www.naukri.com/**', async (route) => {
@@ -191,6 +225,7 @@ export async function serveFakeNaukri(
     const html = (body: string) => route.fulfill({ contentType: 'text/html', body });
     const [, action, id = ''] = pathname.match(/^\/fake\/(\w+)\/(\d+)$/) ?? [];
     if (action === 'click') state.clicks.set(id, (state.clicks.get(id) ?? 0) + 1);
+    if (action === 'save') state.saves.add(id);
     if (action === 'applied') state.applied.add(id);
     if (action === 'answer') state.answers.set(id, [...(state.answers.get(id) ?? []), request.postData() ?? '']);
     if (action === 'form') state.forms.set(id, JSON.parse(request.postData() ?? '{}'));
@@ -201,6 +236,20 @@ export async function serveFakeNaukri(
     }
     if (pathname.startsWith('/nlogin/')) return html('<input id="usernameField">');
     if (/-jobs(-in-[\w-]+)?$/.test(pathname)) return html(SEARCH_PAGE);
+    if (pathname.startsWith('/cloudgateway-chatbot/')) return route.fulfill({ contentType: 'application/json', body: '{"speechResponse":[]}' });
+    if (pathname.endsWith('/apply-workflow/v1/apply')) {
+      const { jobId, kind } = JSON.parse(request.postData() ?? '{}') as { jobId: string; kind: string };
+      const refused = kind === 'api-limit' || state.dailyApplied >= dailyQuota;
+      if (!refused) {
+        state.dailyApplied++;
+        state.applied.add(jobId);
+      }
+      const job = refused
+        ? { status: 403, message: 'You have reached your daily apply limit. Please try again tomorrow.' }
+        : { status: 200, message: 'You have successfully applied to this job.' };
+      const body = { jobs: [{ ...job, jobId }], quotaDetails: { dailyApplied: state.dailyApplied, dailyQuota } };
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify(body) });
+    }
     if (/^\/jobapi\/v3\/search$/.test(pathname)) {
       const cards = typeof search === 'function' ? search() : search;
       return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ jobDetails: cards.map(searchApiJob) }) });

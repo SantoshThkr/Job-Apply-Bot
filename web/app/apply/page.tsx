@@ -26,11 +26,6 @@ export default function ApplyPage() {
   const [startError, setStartError] = useState<string | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
 
-  const toggleAutoApply = (on: boolean) => {
-    if (on && !window.confirm('With auto apply on, the bot clicks Apply and sends real applications on Naukri. Turn it on?')) return;
-    setSettings({ autoApply: on });
-  };
-
   const start = () => {
     setStartError(null);
     setSelected(null);
@@ -44,9 +39,10 @@ export default function ApplyPage() {
         <div className="space-y-4">
           <SettingsForm />
           <label className="flex items-start gap-2 text-sm">
-            <input type="checkbox" role="switch" className="mt-0.5" checked={settings.autoApply} onChange={(e) => toggleAutoApply(e.target.checked)} />
+            <input type="checkbox" role="switch" className="mt-0.5" checked={settings.autoApply} onChange={(e) => setSettings({ autoApply: e.target.checked })} />
             <span>
-              <span className="font-medium">Auto apply</span> <span className="text-slate-500">{settings.autoApply ? 'ON' : 'OFF'}</span>
+              <span className="font-medium">Auto apply</span>{' '}
+              <span className={settings.autoApply ? 'font-semibold text-emerald-700' : 'text-slate-500'}>{settings.autoApply ? 'ON' : 'OFF'}</span>
               <span className="block text-xs text-slate-500">
                 {settings.autoApply
                   ? 'Clicks Apply and answers known questions. On Naukri that sends the application; a job is Applied only when Naukri confirms it.'
@@ -55,7 +51,7 @@ export default function ApplyPage() {
             </span>
           </label>
           <Button variant="primary" className="px-5 py-2" disabled={Boolean(state?.activity) || !profile?.ready || needsDates} onClick={start}>
-            Start auto apply
+            {settings.autoApply ? 'Start auto apply' : 'Start (check only)'}
           </Button>
           {profile && !profile.ready && (
             <p className="text-sm text-amber-900">

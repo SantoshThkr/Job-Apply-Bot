@@ -92,7 +92,7 @@ export type FailureCode =
   | StopCode;
 
 // Why a whole run ended early.
-export type StopCode = 'SECURITY_CHALLENGE' | 'ACCESS_DENIED' | 'SESSION_EXPIRED' | 'BROWSER_CLOSED' | 'UNVERIFIED_STREAK';
+export type StopCode = 'SECURITY_CHALLENGE' | 'ACCESS_DENIED' | 'SESSION_EXPIRED' | 'BROWSER_CLOSED' | 'UNVERIFIED_STREAK' | 'DAILY_LIMIT';
 
 export const RUN_KINDS = ['SEARCH', 'ANALYZE', 'APPLY'] as const;
 export type RunKind = (typeof RUN_KINDS)[number];
@@ -271,7 +271,7 @@ export interface BotState {
   sessionCheckedAt: string | null;
   browser: BrowserStatus;
   activity: Activity | null;
-  activeRun: { id: string; kind: RunKind; startedAt: string; paused: boolean; stopRequested: boolean } | null;
+  activeRun: { id: string; kind: RunKind; startedAt: string; autoApply: boolean; paused: boolean; stopRequested: boolean } | null;
 }
 
 // Jobs by their simple status. Within one run every attempt counts; overall, each job counts once.
@@ -430,9 +430,8 @@ export interface ScopeSummary {
   problems: string[];
 }
 
-// The run settings the dashboard offers as defaults.
+// The run settings the dashboard offers as defaults. Auto apply isn't one: the dashboard's own switch decides it.
 export interface RunDefaults {
-  autoApply: boolean;
   locations: string[];
   experienceYears: number | null;
   toleranceMonths: number;

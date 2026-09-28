@@ -73,12 +73,21 @@ export const APPLY_SELECTORS = {
   // Confirmed on live job pages (2026-09-25). Each appears twice: header and sticky bar.
   applyButton: '#apply-button',
   companySiteButton: '#company-site-button',
+  // Fallbacks by accessible name, for a page without those ids. Only exactly "Apply" or "Apply now"
+  // counts: never "Apply on company site", "Save" or "Applied".
+  applyButtonName: /^\s*apply( now)?\s*$/i,
+  companySiteButtonName: /apply on company('s)? (site|website)/i,
   // Matched on one live applied job so far: Naukri shows "Applied" where the Apply button was.
   appliedMarker: '#already-applied, [class*="apply-button-container"] :is(button, span):text-is("Applied")',
   unavailableText: /no longer accepting applications|job (has )?expired|this job is no longer available/i,
-  // Not yet seen after a real application: Naukri's confirmation text and post-apply page.
-  successText: /you have successfully applied|successfully applied to|applied successfully/i,
-  successPath: '/myapply/saveApply',
+  // Naukri's confirmation text, not yet seen after a real application.
+  successText: /you have successfully applied|successfully applied to|applied successfully|application (has been )?(sent|submitted) successfully/i,
+  // Naukri's own analytics count these pages as a completed application (found in its page code, 2026-09-26).
+  successPath: /^\/(myapply|apply)\/(saveApply|walkInApply|showAcp|saveUnregApply|processRmj)/,
+  // What the Apply click talks to (found in Naukri's page code, 2026-09-26): the apply call itself, and
+  // the recruiter-question chat, which proves questions opened even if its markup isn't recognised.
+  applyApi: /\/apply-workflow\/v\d+\/apply/,
+  chatbotApi: /\/chatbot-services\/botapi\//,
   // Not yet seen on a real questionnaire: the chat drawer where recruiters' questions appear one at a time.
   questionnaire: '[class*="chatbot_Drawer"]',
   botMessage: '[class*="botMsg"]',
@@ -93,6 +102,8 @@ export const APPLY_SELECTORS = {
   applyForm: '[role="dialog"]:has(input, select, textarea)',
   formField: 'input:not([type="hidden"]):not([type="submit"]):not([type="button"]), select, textarea',
   formSubmit: 'button[type="submit"], button:text-matches("^(submit|apply|send)( application)?$", "i")',
+  // Naukri's wording when the day's applications are used up.
+  limitText: /daily (apply |application )?(limit|quota)|limit (to|for) (apply|applying|applications)|quota (is )?(exhausted|exceeded|over)/i,
   // Not yet seen after a real application: wording for an application that did not go through.
   errorText: /something went wrong|could not be (applied|submitted)|unable to (apply|process your application)|failed to apply/i,
 };
